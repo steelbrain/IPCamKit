@@ -5,6 +5,9 @@ import PackageDescription
 let package = Package(
   name: "IPCamKit",
   platforms: [
+    .iOS(.v16),
+    .tvOS(.v16),
+    .macCatalyst(.v16),
     .macOS(.v14)
   ],
   products: [
