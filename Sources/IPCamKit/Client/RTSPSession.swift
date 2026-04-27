@@ -417,7 +417,7 @@ actor SessionState {
     let timeline = try Timeline(start: videoStart, clockRate: stream.clockRateHz)
     inorderParsers[videoIdx] = InorderParser(
       ssrc: videoSsrc, nextSeq: videoSeq, isTcp: transport == .tcp,
-      timeline: timeline)
+      timeline: timeline, onDiagnostic: onDiagnostic)
 
     // Initialize audio depacketizer and inorder parser
     var resolvedAudioCodec: PublicAudioCodec?
@@ -450,7 +450,8 @@ actor SessionState {
           start: audioStart, clockRate: audioStream.clockRateHz)
         inorderParsers[audioIdx] = InorderParser(
           ssrc: resolvedAudioSsrc, nextSeq: audioSeq,
-          isTcp: transport == .tcp, timeline: audioTimeline)
+          isTcp: transport == .tcp, timeline: audioTimeline,
+          onDiagnostic: onDiagnostic)
         resolvedAudioCodec = publicAudioCodec(
           from: audioStream.encodingName)
         resolvedAudioRate = audioStream.clockRateHz
