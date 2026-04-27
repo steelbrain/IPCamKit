@@ -524,6 +524,12 @@ actor SessionState {
             data: interleaved.data, ctx: .dummy,
             streamId: mapping.streamIndex, streamCtx: .dummy)
           {
+            if pkt.payload.isEmpty {
+              onDiagnostic?(
+                RTSPDiagnostic(
+                  severity: .warning,
+                  message: "Empty video RTP payload from camera; packet skipped."))
+            }
             do {
               try depkt.push(pkt)
             } catch {

@@ -8,12 +8,18 @@
 
 ### New
 
-- `onDiagnostic` callback on `RTSPClientSession.init` for observing non-fatal anomalies (e.g. cameras deviating from spec). Emits `RTSPDiagnostic` values with `info` / `warning` / `error` severity. The first event wired up: a `warning` when a camera issues a different Session ID at audio SETUP than at video SETUP.
+- `onDiagnostic` callback on `RTSPClientSession.init` for observing non-fatal anomalies (e.g. cameras deviating from spec). Emits `RTSPDiagnostic` values with `info` / `warning` / `error` severity. Initial events:
+  - `warning` when a camera issues a different Session ID at audio SETUP than at video SETUP.
+  - `warning` when an empty video RTP payload is received and skipped.
 
 ### Improvements
 
 - Add iOS 16, tvOS 16, and macCatalyst 16 to supported platforms (Thanks @brientim)
 - Lower macOS minimum from 14 to 13
+
+### Fixes
+
+- Stop tearing down the video stream when a camera emits an empty (or, for H.265, sub-2-byte) RTP payload. Such packets are now skipped — matches GStreamer / Live555 behavior.
 
 ## 0.1.1
 

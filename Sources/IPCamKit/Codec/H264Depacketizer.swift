@@ -193,7 +193,7 @@ struct H264Depacketizer: Sendable {
     // Parse NAL header from payload
     let payload = pkt.payload
     guard !payload.isEmpty else {
-      return .failure(DepacketizeError("Empty NAL"))
+      return .success(())
     }
 
     let nalHeaderByte = payload[payload.startIndex]
