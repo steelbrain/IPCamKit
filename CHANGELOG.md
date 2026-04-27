@@ -6,10 +6,22 @@
 
 - Remove `SessionIdPolicy` enum and the `sessionIdPolicy:` parameter from `RTSPClientSession.init`. Audio SETUP responses that return a different session ID are now always accepted (latest wins) instead of being a configurable choice.
 
+### New
+
+- `onDiagnostic` callback on `RTSPClientSession.init` for observing non-fatal anomalies (e.g. cameras deviating from spec). Emits `RTSPDiagnostic` values with `info` / `warning` / `error` severity. Initial events:
+  - `warning` when a camera issues a different Session ID at audio SETUP than at video SETUP.
+  - `warning` when an empty video RTP payload is received and skipped.
+  - `warning` when an out-of-order RTP packet is received on TCP-interleaved transport (and dropped).
+
 ### Improvements
 
 - Add iOS 16, tvOS 16, and macCatalyst 16 to supported platforms (Thanks @brientim)
 - Lower macOS minimum from 14 to 13
+
+### Fixes
+
+- Stop tearing down the video stream when a camera emits an empty (or, for H.265, sub-2-byte) RTP payload. Such packets are now skipped — matches GStreamer / Live555 behavior.
+- Stop tearing down the session when an out-of-order RTP packet arrives on TCP-interleaved transport. Packet is now dropped to match UDP behavior, matching FFmpeg / GStreamer / Live555 / ExoPlayer (none of which abort on this case). TCP byte-stream ordering does not imply RTP-sequence ordering — buggy camera packetizers can write packets out-of-order before muxing.
 
 ## 0.1.1
 

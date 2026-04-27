@@ -248,6 +248,23 @@ struct H265DepacketizerTests {
     #expect(p.genericParameters.pixelDimensions?.width == 2304)
     #expect(p.genericParameters.pixelDimensions?.height == 1296)
   }
+
+  /// Short RTP payloads (zero or one byte — too short for the 2-byte H.265 NAL
+  /// header) are tolerated and do not tear the stream down. Previously this
+  /// surfaced as a `DepacketizeError("Short NAL")` that propagated up and
+  /// ended the session. See CHANGELOG 0.2.0.
+  @Test("Short RTP payload tolerated")
+  func shortRTPPayload() throws {
+    var d = try H265Depacketizer(clockRate: 90000, formatSpecificParams: nil)
+
+    // Zero-byte payload — must not throw.
+    try d.push(makeH265Packet(seq: 0, timestamp: h265Ts0, mark: false, payload: Data()))
+    #expect(d.pull() == nil)
+
+    // One-byte payload (insufficient for H.265's 2-byte NAL header) — must not throw.
+    try d.push(makeH265Packet(seq: 1, timestamp: h265Ts0, mark: false, payload: Data([0x40])))
+    #expect(d.pull() == nil)
+  }
 }
 
 // MARK: - NAL Tests

@@ -169,7 +169,7 @@ struct H265Depacketizer: Sendable {
     // Parse 2-byte NAL header from payload
     let payload = pkt.payload
     guard payload.count >= 2 else {
-      return .failure(DepacketizeError("Short NAL"))
+      return .success(())
     }
     let hdr: H265NALHeader
     do {

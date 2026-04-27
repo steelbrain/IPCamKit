@@ -20,7 +20,7 @@ enum UnknownRtcpSsrcPolicy: Sendable {
 /// Handles:
 /// - SSRC validation (reject mismatched SSRCs)
 /// - Sequence number tracking and loss detection
-/// - Out-of-order packet detection (skip on UDP, error on TCP)
+/// - Out-of-order packet detection (drop, emit diagnostic on TCP)
 /// - Geovision PT=50 quirk (silently drop)
 /// - RTCP compound packet validation and SR timestamp placement
 struct InorderParser: Sendable {
@@ -30,6 +30,7 @@ struct InorderParser: Sendable {
   var timeline: Timeline
   private var unknownRtcpSsrcPolicy: UnknownRtcpSsrcPolicy
   private var seenUnknownRtcpSession: Bool = false
+  private let onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
 
   /// Number of RTP packets seen.
   private(set) var seenRtpPackets: UInt64 = 0
@@ -39,13 +40,15 @@ struct InorderParser: Sendable {
 
   init(
     ssrc: UInt32?, nextSeq: UInt16?, isTcp: Bool, timeline: Timeline,
-    unknownRtcpSsrcPolicy: UnknownRtcpSsrcPolicy = .dropPackets
+    unknownRtcpSsrcPolicy: UnknownRtcpSsrcPolicy = .dropPackets,
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil
   ) {
     self.ssrc = ssrc
     self.nextSeq = nextSeq
     self.isTcp = isTcp
     self.timeline = timeline
     self.unknownRtcpSsrcPolicy = unknownRtcpSsrcPolicy
+    self.onDiagnostic = onDiagnostic
   }
 
   /// Process an incoming RTP packet.
@@ -87,12 +90,17 @@ struct InorderParser: Sendable {
     if let expected = nextSeq {
       let delta = raw.sequenceNumber &- expected
       if delta > 0x8000 {
-        // Out of order
+        // Out of order. UDP reordering is normal and stays silent; TCP-interleaved
+        // reordering means the camera's packetizer wrote sequence-numbers out of
+        // order before muxing, which is camera misbehavior worth surfacing.
         if isTcp {
-          throw RTSPError.depacketizationError(
-            "Out-of-order packet on TCP: seq=\(raw.sequenceNumber), expected=\(expected)")
+          onDiagnostic?(
+            RTSPDiagnostic(
+              severity: .warning,
+              message:
+                "Out-of-order RTP packet on TCP-interleaved transport: "
+                + "seq=\(raw.sequenceNumber), expected=\(expected); packet dropped."))
         }
-        // UDP: silently drop out-of-order packets
         return nil
       }
       loss = delta

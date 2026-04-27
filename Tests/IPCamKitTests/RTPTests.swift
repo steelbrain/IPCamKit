@@ -330,4 +330,58 @@ struct InorderParserTests {
     #expect(result3 != nil)
     #expect(result3!.timestamp.elapsed == 1)  // delta from start=2 to 3
   }
+
+  /// Out-of-order packets on TCP-interleaved transport are dropped (matching UDP)
+  /// and surfaced via the onDiagnostic callback as `.warning`. Previously this case
+  /// threw and tore down the session — see CHANGELOG 0.2.0.
+  @Test("Out-of-order packets dropped on TCP and diagnostic emitted")
+  func outOfOrderTcp() throws {
+    let captured = DiagnosticBox()
+
+    var timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    var parser = InorderParser(
+      ssrc: 0x0D25_614E, nextSeq: nil, isTcp: true, timeline: timeline,
+      onDiagnostic: { captured.append($0) })
+
+    // Packet with seq=2 arrives first
+    let pkt1 = RTPPacketBuilder(
+      sequenceNumber: 2, timestamp: 2, payloadType: 96,
+      ssrc: 0x0D25_614E, mark: true)
+    let data1 = try pkt1.build(payload: Data("pkt 2".utf8)).get().data
+    let result1 = try parser.rtp(
+      data: data1, ctx: .dummy, streamId: 0, streamCtx: .dummy)
+    #expect(result1 != nil)
+    #expect(captured.events.isEmpty)
+
+    // Packet with seq=1 arrives late — must drop without throwing and emit a warning
+    let pkt2 = RTPPacketBuilder(
+      sequenceNumber: 1, timestamp: 1, payloadType: 96,
+      ssrc: 0x0D25_614E, mark: true)
+    let data2 = try pkt2.build(payload: Data("pkt 1".utf8)).get().data
+    let result2 = try parser.rtp(
+      data: data2, ctx: .dummy, streamId: 0, streamCtx: .dummy)
+    #expect(result2 == nil)
+    #expect(captured.events.count == 1)
+    #expect(captured.events.first?.severity == .warning)
+    #expect(captured.events.first?.message.contains("seq=1") == true)
+    #expect(captured.events.first?.message.contains("expected=3") == true)
+  }
+}
+
+/// Thread-safe collector for diagnostic events captured during a test.
+private final class DiagnosticBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var _events: [RTSPDiagnostic] = []
+
+  func append(_ event: RTSPDiagnostic) {
+    lock.lock()
+    defer { lock.unlock() }
+    _events.append(event)
+  }
+
+  var events: [RTSPDiagnostic] {
+    lock.lock()
+    defer { lock.unlock() }
+    return _events
+  }
 }
