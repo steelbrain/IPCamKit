@@ -1,5 +1,11 @@
 # Changelog
 
+## Upcoming
+
+### Improvements
+
+- Add visionOS 1.0 to supported platforms
+
 ## 0.2.0
 
 ### Breaking changes
