@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+### Improvements
+
+- Add iOS 16, tvOS 16, and macCatalyst 16 to supported platforms
+- Lower macOS minimum from 14 to 13
+
 ## 0.1.1
 
 ### Improvements
