@@ -61,20 +61,10 @@ public struct SessionDescription: Sendable {
 /// }
 /// await session.stop()
 /// ```
-public enum SessionIdPolicy: Sendable {
-  /// Default policy: currently requireMatch.
-  case defaultPolicy
-  /// Requires the server to return the same session ID for all SETUP requests.
-  case requireMatch
-  /// Uses the session ID returned from the first SETUP request and ignores subsequent changes.
-  case useFirst
-}
-
 public final class RTSPClientSession: Sendable {
   private let url: String
   private let credentials: Credentials?
   private let transport: Transport
-  private let sessionIdPolicy: SessionIdPolicy
   private let userAgent: String
   private let state: SessionState
 
@@ -82,13 +72,11 @@ public final class RTSPClientSession: Sendable {
     url: String,
     credentials: Credentials? = nil,
     transport: Transport = .tcp,
-    sessionIdPolicy: SessionIdPolicy = .defaultPolicy,
     userAgent: String = "IPCamKit"
   ) {
     self.url = url
     self.credentials = credentials
     self.transport = transport
-    self.sessionIdPolicy = sessionIdPolicy
     self.userAgent = userAgent
     self.state = SessionState()
   }
@@ -101,7 +89,6 @@ public final class RTSPClientSession: Sendable {
       url: url,
       credentials: credentials,
       transport: transport,
-      sessionIdPolicy: sessionIdPolicy,
       userAgent: userAgent
     )
   }
@@ -247,7 +234,6 @@ actor SessionState {
     url: String,
     credentials: Credentials?,
     transport: Transport,
-    sessionIdPolicy: SessionIdPolicy,
     userAgent: String
   ) async throws -> SessionDescription {
     // Parse URL
@@ -343,14 +329,7 @@ actor SessionState {
         method: .setup, url: audioSetupURL,
         extraHeaders: audioSetupHeaders)
       let audioSetup = try parseSetup(response: audioSetupResp)
-      if let sid = sessionId, sid != audioSetup.session.id {
-        if sessionIdPolicy == .useFirst {
-          // Ignore the new session ID
-        } else {
-          throw RTSPError.sessionSetupFailed(
-            statusCode: 0, reason: "Session ID changed from \(sid) to \(audioSetup.session.id)")
-        }
-      }
+      sessionId = audioSetup.session.id
       audioSetupSSRC = audioSetup.ssrc
       presMut.streams[audioIdx].state = .setup(
         StreamStateInit(ssrc: audioSetup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))

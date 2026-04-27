@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.1.2
+## 0.2.0
+
+### Breaking changes
+
+- Remove `SessionIdPolicy` enum and the `sessionIdPolicy:` parameter from `RTSPClientSession.init`. Audio SETUP responses that return a different session ID are now always accepted (latest wins) instead of being a configurable choice.
 
 ### Improvements
 
