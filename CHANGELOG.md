@@ -6,6 +6,10 @@
 
 - Remove `SessionIdPolicy` enum and the `sessionIdPolicy:` parameter from `RTSPClientSession.init`. Audio SETUP responses that return a different session ID are now always accepted (latest wins) instead of being a configurable choice.
 
+### New
+
+- `onDiagnostic` callback on `RTSPClientSession.init` for observing non-fatal anomalies (e.g. cameras deviating from spec). Emits `RTSPDiagnostic` values with `info` / `warning` / `error` severity. The first event wired up: a `warning` when a camera issues a different Session ID at audio SETUP than at video SETUP.
+
 ### Improvements
 
 - Add iOS 16, tvOS 16, and macCatalyst 16 to supported platforms (Thanks @brientim)

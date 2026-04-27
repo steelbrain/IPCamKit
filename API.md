@@ -39,11 +39,27 @@ init(
   url: String,
   credentials: Credentials? = nil,
   transport: Transport = .tcp,
-  userAgent: String = "IPCamKit")
+  userAgent: String = "IPCamKit",
+  onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil)
 
 func start() async throws -> SessionDescription
 func frames() -> AsyncThrowingStream<PublicCodecItem, Error>
 func stop() async
+```
+
+### RTSPDiagnostic
+
+Non-fatal anomalies observed during a session (e.g. cameras deviating from spec). The
+stream stays alive; the callback is purely observational. `severity == .error` here
+means real damage (e.g. dropped data) but the stream continues — distinct from a
+thrown `RTSPError`, which means the stream is dead.
+
+```swift
+struct RTSPDiagnostic: Sendable {
+  enum Severity: Sendable { case info, warning, error }
+  let severity: Severity
+  let message: String
+}
 ```
 
 ### Credentials

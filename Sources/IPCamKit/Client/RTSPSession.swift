@@ -30,6 +30,26 @@ public enum PublicAudioCodec: Sendable {
   case other(String)
 }
 
+/// Diagnostic event emitted by `RTSPClientSession` when a non-fatal anomaly is observed.
+///
+/// Use the `onDiagnostic` callback on `RTSPClientSession.init` to receive these.
+/// `severity == .error` here means real damage (e.g. dropped data) while the stream
+/// is still alive — distinct from a thrown `RTSPError`, which means the stream is dead.
+public struct RTSPDiagnostic: Sendable {
+  public enum Severity: Sendable {
+    case info
+    case warning
+    case error
+  }
+  public let severity: Severity
+  public let message: String
+
+  public init(severity: Severity, message: String) {
+    self.severity = severity
+    self.message = message
+  }
+}
+
 /// Parsed session description returned from `start()`.
 public struct SessionDescription: Sendable {
   public let videoCodec: VideoCodec
@@ -66,18 +86,21 @@ public final class RTSPClientSession: Sendable {
   private let credentials: Credentials?
   private let transport: Transport
   private let userAgent: String
+  private let onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
   private let state: SessionState
 
   public init(
     url: String,
     credentials: Credentials? = nil,
     transport: Transport = .tcp,
-    userAgent: String = "IPCamKit"
+    userAgent: String = "IPCamKit",
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil
   ) {
     self.url = url
     self.credentials = credentials
     self.transport = transport
     self.userAgent = userAgent
+    self.onDiagnostic = onDiagnostic
     self.state = SessionState()
   }
 
@@ -89,7 +112,8 @@ public final class RTSPClientSession: Sendable {
       url: url,
       credentials: credentials,
       transport: transport,
-      userAgent: userAgent
+      userAgent: userAgent,
+      onDiagnostic: onDiagnostic
     )
   }
 
@@ -229,13 +253,16 @@ actor SessionState {
   private var inorderParsers: [Int: InorderParser] = [:]
   private var userAgent: String?
   private var isPlaying = false
+  private var onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
 
   func start(
     url: String,
     credentials: Credentials?,
     transport: Transport,
-    userAgent: String
+    userAgent: String,
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
   ) async throws -> SessionDescription {
+    self.onDiagnostic = onDiagnostic
     // Parse URL
     guard let urlComponents = URLComponents(string: url) else {
       throw RTSPError.connectionFailed("Invalid URL: \(url)")
@@ -329,6 +356,14 @@ actor SessionState {
         method: .setup, url: audioSetupURL,
         extraHeaders: audioSetupHeaders)
       let audioSetup = try parseSetup(response: audioSetupResp)
+      if let prev = sessionId, prev != audioSetup.session.id {
+        onDiagnostic?(
+          RTSPDiagnostic(
+            severity: .warning,
+            message:
+              "Camera issued a new Session ID at audio SETUP "
+              + "(\(prev) -> \(audioSetup.session.id)); rolling forward."))
+      }
       sessionId = audioSetup.session.id
       audioSetupSSRC = audioSetup.ssrc
       presMut.streams[audioIdx].state = .setup(
