@@ -666,6 +666,36 @@ struct H264DepacketizerTests {
     // Third pull: nothing
     #expect(d.pull() == nil)
   }
+
+  /// Empty RTP payload (zero bytes — no NAL header at all) is tolerated and
+  /// does not tear the stream down. Some camera firmwares emit such packets
+  /// as keep-alives or muxer artifacts; previously this surfaced as a
+  /// `DepacketizeError("Empty NAL")` that propagated up and ended the session.
+  /// See CHANGELOG 0.2.0.
+  @Test("Empty RTP payload tolerated")
+  func emptyRTPPayload() throws {
+    var d = try H264Depacketizer(clockRate: 90000, formatSpecificParams: dahuaFmtp)
+
+    // Empty payload — must not throw.
+    try d.push(makePacket(seq: 0, timestamp: ts0, mark: false, payload: Data()))
+    #expect(d.pull() == nil)
+
+    // A subsequent valid packet still produces a frame.
+    try d.push(
+      makePacket(
+        seq: 1, timestamp: ts0, mark: true, payload: Data([0x06]) + Data("plain".utf8)))
+
+    guard case .success(.videoFrame(let frame)) = d.pull() else {
+      Issue.record("Expected video frame after empty packet")
+      return
+    }
+
+    var expected = Data()
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x06, 0x06])
+    expected.append(Data("plain".utf8))
+    #expect(frame.data == expected)
+    #expect(d.pull() == nil)
+  }
 }
 
 // MARK: - Test Data
