@@ -8,7 +8,7 @@
 
 ### Improvements
 
-- Add iOS 16, tvOS 16, and macCatalyst 16 to supported platforms
+- Add iOS 16, tvOS 16, and macCatalyst 16 to supported platforms (Thanks @brientim)
 - Lower macOS minimum from 14 to 13
 
 ## 0.1.1
