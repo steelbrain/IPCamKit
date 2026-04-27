@@ -39,7 +39,6 @@ init(
   url: String,
   credentials: Credentials? = nil,
   transport: Transport = .tcp,
-  sessionIdPolicy: SessionIdPolicy = .defaultPolicy,
   userAgent: String = "IPCamKit")
 
 func start() async throws -> SessionDescription
@@ -60,16 +59,6 @@ init(username: String, password: String)
 enum Transport: Sendable {
   case tcp   // RTP interleaved over RTSP TCP connection
   case udp   // RTP/RTCP on separate UDP ports
-}
-```
-
-### SessionIdPolicy
-
-```swift
-enum SessionIdPolicy: Sendable {
-  case defaultPolicy   // Currently requireMatch
-  case requireMatch    // Same session ID for all SETUP requests
-  case useFirst        // Use first SETUP session ID, ignore changes
 }
 ```
 
