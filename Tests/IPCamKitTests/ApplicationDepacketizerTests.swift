@@ -57,11 +57,13 @@ struct ApplicationDepacketizerTests {
   @Test("Multi-packet document concatenates payload and emits on marker")
   func multiPacketDocument() throws {
     var d = ApplicationDepacketizer()
-    try d.push(makeMetadataPacket(seq: 0, timestamp: 1000, mark: false, payload: Data("<root>".utf8)))
+    try d.push(
+      makeMetadataPacket(seq: 0, timestamp: 1000, mark: false, payload: Data("<root>".utf8)))
     #expect(d.pull() == nil)
     try d.push(makeMetadataPacket(seq: 1, timestamp: 1000, mark: false, payload: Data("body".utf8)))
     #expect(d.pull() == nil)
-    try d.push(makeMetadataPacket(seq: 2, timestamp: 1000, mark: true, payload: Data("</root>".utf8)))
+    try d.push(
+      makeMetadataPacket(seq: 2, timestamp: 1000, mark: true, payload: Data("</root>".utf8)))
     let frame = pullFrame(&d)
     #expect(frame?.data == Data("<root>body</root>".utf8))
     #expect(frame?.loss == 0)
@@ -77,7 +79,8 @@ struct ApplicationDepacketizerTests {
     let f1 = pullFrame(&d)
     #expect(f1?.data == Data("doc1".utf8))
     #expect(f1?.loss == 0)
-    try d.push(makeMetadataPacket(seq: 1, timestamp: 91_000, mark: true, payload: Data("doc2".utf8)))
+    try d.push(
+      makeMetadataPacket(seq: 1, timestamp: 91_000, mark: true, payload: Data("doc2".utf8)))
     let f2 = pullFrame(&d)
     #expect(f2?.data == Data("doc2".utf8))
     #expect(f2?.loss == 0)
