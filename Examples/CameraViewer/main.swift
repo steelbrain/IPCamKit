@@ -330,7 +330,7 @@ final class CameraViewerDelegate: NSObject, NSApplicationDelegate {
             layer.enqueue(sample)
           }
 
-        case .rtcp:
+        case .metadata, .rtcp:
           break
         }
       }

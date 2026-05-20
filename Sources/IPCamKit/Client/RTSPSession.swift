@@ -139,10 +139,11 @@ public final class RTSPClientSession: Sendable {
   }
 }
 
-/// A decoded frame (video or audio) exposed to consumers.
+/// A decoded frame (video, audio, or metadata) exposed to consumers.
 public enum PublicCodecItem: Sendable {
   case video(PublicVideoFrame)
   case audio(PublicAudioFrame)
+  case metadata(PublicMetadataFrame)
   case rtcp(PublicRTCPPacket)
 }
 
@@ -166,6 +167,23 @@ public struct PublicAudioFrame: Sendable {
 
   /// Channel count, if known.
   public let channels: UInt16?
+
+  /// Number of RTP packets lost before this frame.
+  public let loss: UInt16
+}
+
+/// A metadata frame from an RTSP `application` stream (typically ONVIF analytics).
+public struct PublicMetadataFrame: Sendable {
+  /// Raw payload bytes. For `vnd.onvif.metadata` this is a UTF-8 XML
+  /// document with root `tt:MetaDataStream`, optionally GZIP-compressed
+  /// (consult the SDP `encodingName` for the exact format).
+  public let data: Data
+
+  /// Presentation timestamp in seconds, derived from the RTP timestamp.
+  public let timestamp: Double
+
+  /// SDP encoding name (e.g. `vnd.onvif.metadata`).
+  public let encodingName: String
 
   /// Number of RTP packets lost before this frame.
   public let loss: UInt16
@@ -243,12 +261,15 @@ actor SessionState {
   private var authenticator: RTSPAuthenticator?
   private var depacketizer: VideoDepacketizer?
   private var audioDepacketizer: AudioDepacketizer?
+  private var applicationDepacketizer: ApplicationDepacketizer?
   private var url: String?
   private var videoStreamIndex: Int?
   private var audioStreamIndex: Int?
+  private var applicationStreamIndex: Int?
   private var audioEncodingName: String?
   private var audioClockRate: UInt32?
   private var audioChannels: UInt16?
+  private var applicationEncodingName: String?
   private var channelMappings = ChannelMappings()
   private var inorderParsers: [Int: InorderParser] = [:]
   private var userAgent: String?
@@ -375,6 +396,54 @@ actor SessionState {
       audioChannels = audioStream.channels
     }
 
+    // Find and SETUP application (metadata) stream — optional, best-effort.
+    let applicationIdx = presMut.streams.firstIndex(where: { s in
+      s.media == "application" && isApplicationEncodingSupported(s.encodingName)
+    })
+    var applicationSetupSSRC: UInt32?
+
+    if let applicationIdx = applicationIdx {
+      let applicationStream = presMut.streams[applicationIdx]
+      let applicationSetupURL = applicationStream.control ?? url
+      var applicationSetupHeaders: [(String, String)] = []
+      if transport == .tcp {
+        let applicationChannelId = channelMappings.nextUnassigned() ?? 4
+        applicationSetupHeaders.append(
+          (
+            "Transport",
+            "RTP/AVP/TCP;unicast;interleaved=\(applicationChannelId)-\(applicationChannelId + 1)"
+          ))
+        try channelMappings.assign(
+          channelId: applicationChannelId, streamIndex: applicationIdx)
+      } else {
+        applicationSetupHeaders.append(("Transport", "RTP/AVP;unicast"))
+      }
+      if let sid = sessionId {
+        applicationSetupHeaders.append(("Session", sid))
+      }
+      let applicationSetupResp = try await sendRequest(
+        method: .setup, url: applicationSetupURL,
+        extraHeaders: applicationSetupHeaders)
+      let applicationSetup = try parseSetup(response: applicationSetupResp)
+      if let prev = sessionId, prev != applicationSetup.session.id {
+        onDiagnostic?(
+          RTSPDiagnostic(
+            severity: .warning,
+            message:
+              "Camera issued a new Session ID at application SETUP "
+              + "(\(prev) -> \(applicationSetup.session.id)); rolling forward."))
+      }
+      sessionId = applicationSetup.session.id
+      applicationSetupSSRC = applicationSetup.ssrc
+      presMut.streams[applicationIdx].state = .setup(
+        StreamStateInit(
+          ssrc: applicationSetup.ssrc, initialSeq: nil,
+          initialRtptime: nil, ctx: .dummy))
+
+      applicationStreamIndex = applicationIdx
+      applicationEncodingName = applicationStream.encodingName
+    }
+
     // PLAY
     var playHeaders: [(String, String)] = []
     if let sid = sessionId {
@@ -456,6 +525,44 @@ actor SessionState {
           from: audioStream.encodingName)
         resolvedAudioRate = audioStream.clockRateHz
         resolvedAudioChannels = audioStream.channels
+      }
+    }
+
+    // Initialize application (metadata) depacketizer + inorder parser.
+    // Best-effort: if the timeline can't be built (e.g. malformed clock
+    // rate in SDP), disable the stream rather than failing the session.
+    if let applicationIdx = applicationIdx {
+      let applicationStream = presMut.streams[applicationIdx]
+
+      var applicationStart: UInt32?
+      var applicationSeq: UInt16?
+      var resolvedApplicationSsrc = applicationSetupSSRC
+
+      if case .setup(let init_) = presMut.streams[applicationIdx].state {
+        applicationStart = init_.initialRtptime
+        if let seq = init_.initialSeq, seq != 0, seq != 1 {
+          applicationSeq = seq
+        }
+        if let s = init_.ssrc { resolvedApplicationSsrc = s }
+      }
+
+      do {
+        let applicationTimeline = try Timeline(
+          start: applicationStart, clockRate: applicationStream.clockRateHz)
+        inorderParsers[applicationIdx] = InorderParser(
+          ssrc: resolvedApplicationSsrc, nextSeq: applicationSeq,
+          isTcp: transport == .tcp, timeline: applicationTimeline,
+          onDiagnostic: onDiagnostic)
+        applicationDepacketizer = ApplicationDepacketizer(onDiagnostic: onDiagnostic)
+      } catch {
+        onDiagnostic?(
+          RTSPDiagnostic(
+            severity: .warning,
+            message:
+              "Failed to initialize application stream: \(error); "
+              + "metadata will not be delivered."))
+        applicationStreamIndex = nil
+        applicationEncodingName = nil
       }
     }
 
@@ -577,6 +684,33 @@ actor SessionState {
             }
           }
           audioDepacketizer = depkt
+        } else if let applicationIdx = applicationStreamIndex,
+          mapping.streamIndex == applicationIdx
+        {
+          guard var depkt = applicationDepacketizer else { continue }
+          if let pkt = try parser.rtp(
+            data: interleaved.data, ctx: .dummy,
+            streamId: mapping.streamIndex, streamCtx: .dummy)
+          {
+            try depkt.push(pkt)
+            while let result = depkt.pull() {
+              switch result {
+              case .success(.metadataFrame(let frame)):
+                let publicFrame = PublicMetadataFrame(
+                  data: frame.data,
+                  timestamp: frame.timestamp.elapsedSeconds,
+                  encodingName: applicationEncodingName ?? "",
+                  loss: frame.loss
+                )
+                continuation.yield(.metadata(publicFrame))
+              case .failure(let err):
+                throw RTSPError.depacketizationError("Metadata depacketization failed: \(err)")
+              default:
+                break
+              }
+            }
+          }
+          applicationDepacketizer = depkt
         }
 
         inorderParsers[mapping.streamIndex] = parser
@@ -729,6 +863,15 @@ actor SessionState {
     switch name {
     case "mpeg4-generic", "pcmu", "pcma", "l16", "g722", "g723",
       "u8", "dvi4", "g726-16", "g726-24", "g726-32", "g726-40":
+      return true
+    default:
+      return false
+    }
+  }
+
+  private func isApplicationEncodingSupported(_ name: String) -> Bool {
+    switch name {
+    case "vnd.onvif.metadata":
       return true
     default:
       return false
