@@ -50,24 +50,41 @@ public struct RTSPDiagnostic: Sendable {
   }
 }
 
-/// Parsed session description returned from `start()`.
-public struct SessionDescription: Sendable {
-  public let videoCodec: VideoCodec
-  public let sps: Data
-  public let pps: Data
-  /// VPS data (H.265 only, nil for H.264).
+/// Video stream details, surfaced when a supported video stream is active.
+///
+/// `codec` and `clockRate` are always populated. `sps`/`pps`/`vps`/`resolution`
+/// are `nil` until the depacketizer has observed parameter sets — for most
+/// cameras this happens in-band on the first packet; cameras that ship the
+/// parameter sets in SDP `fmtp` will have them set at `start()` time.
+public struct VideoStream: Sendable {
+  public let codec: VideoCodec
+  public let clockRate: UInt32
+  public let sps: Data?
+  public let pps: Data?
+  /// H.265 only; nil for H.264.
   public let vps: Data?
   public let resolution: (width: Int, height: Int)?
-  public let clockRate: UInt32
+}
 
-  /// Audio codec, if an audio stream was found.
-  public let audioCodec: PublicAudioCodec?
-  /// Audio sample rate in Hz, if an audio stream was found.
-  public let audioSampleRate: UInt32?
-  /// Audio channel count, if known.
-  public let audioChannels: UInt16?
+/// Audio stream details, surfaced when a supported audio stream is active.
+///
+/// `codec` and `sampleRate` are always populated. `channels` and `extraData`
+/// reflect what the camera advertised; they are codec-dependent.
+public struct AudioStream: Sendable {
+  public let codec: PublicAudioCodec
+  public let sampleRate: UInt32
+  public let channels: UInt16?
   /// Codec-specific extra data (e.g. AudioSpecificConfig for AAC).
-  public let audioExtraData: Data?
+  public let extraData: Data?
+}
+
+/// Parsed session description returned from `start()`.
+///
+/// At least one of `video`, `audio`, or `metadataEncoding` is non-`nil` —
+/// a session with zero usable streams is rejected at `start()`.
+public struct SessionDescription: Sendable {
+  public let video: VideoStream?
+  public let audio: AudioStream?
 
   /// SDP encoding name of the analytics-metadata stream if one was set up
   /// (e.g. `vnd.onvif.metadata`), or `nil` if no metadata stream is active.
@@ -316,41 +333,42 @@ actor SessionState {
     var presMut = try parseDescribe(requestURL: url, response: describeResp)
     presentation = presMut
 
-    // Find first H.264 or H.265 video stream
-    guard
-      let videoIdx = presMut.streams.firstIndex(where: {
-        $0.media == "video" && ($0.encodingName == "h264" || $0.encodingName == "h265")
-      })
-    else {
-      throw RTSPError.sessionSetupFailed(
-        statusCode: 0, reason: "No H.264/H.265 video stream found")
-    }
-
-    let stream = presMut.streams[videoIdx]
     self.url = url
-    self.videoStreamIndex = videoIdx
 
-    // SETUP
-    let setupURL = stream.control ?? url
-    var setupHeaders: [(String, String)] = []
-    if transport == .tcp {
-      let channelId = channelMappings.nextUnassigned() ?? 0
-      setupHeaders.append(
-        (
-          "Transport",
-          "RTP/AVP/TCP;unicast;interleaved=\(channelId)-\(channelId + 1)"
-        ))
-      try channelMappings.assign(channelId: channelId, streamIndex: videoIdx)
-    } else {
-      setupHeaders.append(("Transport", "RTP/AVP;unicast"))
+    // Find first H.264 or H.265 video stream — optional. Cameras can be
+    // configured to expose audio-only or metadata-only RTSP sessions
+    // (e.g. Axis with `video=0`), in which case we proceed without video
+    // and require at least one of audio/metadata to be set up.
+    let videoIdx = presMut.streams.firstIndex(where: {
+      $0.media == "video" && isVideoEncodingSupported($0.encodingName)
+    })
+    var videoSetupSSRC: UInt32?
+
+    if let videoIdx = videoIdx {
+      let stream = presMut.streams[videoIdx]
+      let setupURL = stream.control ?? url
+      var setupHeaders: [(String, String)] = []
+      if transport == .tcp {
+        let channelId = channelMappings.nextUnassigned() ?? 0
+        setupHeaders.append(
+          (
+            "Transport",
+            "RTP/AVP/TCP;unicast;interleaved=\(channelId)-\(channelId + 1)"
+          ))
+        try channelMappings.assign(channelId: channelId, streamIndex: videoIdx)
+      } else {
+        setupHeaders.append(("Transport", "RTP/AVP;unicast"))
+      }
+
+      let setupResp = try await sendRequest(
+        method: .setup, url: setupURL, extraHeaders: setupHeaders)
+      let setup = try parseSetup(response: setupResp)
+      sessionId = setup.session.id
+      videoSetupSSRC = setup.ssrc
+      presMut.streams[videoIdx].state = .setup(
+        StreamStateInit(ssrc: setup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))
+      self.videoStreamIndex = videoIdx
     }
-
-    let setupResp = try await sendRequest(
-      method: .setup, url: setupURL, extraHeaders: setupHeaders)
-    let setup = try parseSetup(response: setupResp)
-    sessionId = setup.session.id
-    presMut.streams[videoIdx].state = .setup(
-      StreamStateInit(ssrc: setup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))
 
     // Find and SETUP audio stream (optional, best-effort)
     let audioIdx = presMut.streams.firstIndex(where: { s in
@@ -462,6 +480,20 @@ actor SessionState {
       }
     }
 
+    // Require at least one usable stream — a session with no video, audio,
+    // or metadata is degenerate (DESCRIBE succeeded but nothing is carrying
+    // payload), and sending PLAY would just open the door to packets we
+    // can't route.
+    if videoStreamIndex == nil && audioStreamIndex == nil && applicationStreamIndex == nil {
+      let offered = presMut.streams.map { "\($0.media)/\($0.encodingName)" }
+        .joined(separator: ", ")
+      throw RTSPError.sessionSetupFailed(
+        statusCode: 0,
+        reason:
+          "No supported video, audio, or metadata stream was set up "
+          + "(offered: \(offered.isEmpty ? "<none>" : offered)).")
+    }
+
     // PLAY
     var playHeaders: [(String, String)] = []
     if let sid = sessionId {
@@ -475,36 +507,42 @@ actor SessionState {
     try parsePlay(response: playResp, presentation: &presMut)
     presentation = presMut
 
-    // Initialize video depacketizer
-    if stream.encodingName == "h265" {
-      depacketizer = .h265(
-        try H265Depacketizer(
-          clockRate: stream.clockRateHz,
-          formatSpecificParams: stream.formatSpecificParams))
-    } else {
-      depacketizer = .h264(
-        try H264Depacketizer(
-          clockRate: stream.clockRateHz,
-          formatSpecificParams: stream.formatSpecificParams))
-    }
-
-    // Initialize video timeline and inorder parser
-    var videoStart: UInt32?
-    var videoSeq: UInt16?
-    var videoSsrc: UInt32? = setup.ssrc
-
-    if case .setup(let init_) = presMut.streams[videoIdx].state {
-      videoStart = init_.initialRtptime
-      if let seq = init_.initialSeq, seq != 0, seq != 1 {
-        videoSeq = seq
+    // Initialize video depacketizer + timeline + inorder parser. Conditional
+    // on a successful video SETUP — when no video stream was set up,
+    // `videoStreamIndex` is nil and we skip the entire video pipeline.
+    var videoClockRate: UInt32?
+    if let videoIdx = videoStreamIndex {
+      let stream = presMut.streams[videoIdx]
+      if stream.encodingName == "h265" {
+        depacketizer = .h265(
+          try H265Depacketizer(
+            clockRate: stream.clockRateHz,
+            formatSpecificParams: stream.formatSpecificParams))
+      } else {
+        depacketizer = .h264(
+          try H264Depacketizer(
+            clockRate: stream.clockRateHz,
+            formatSpecificParams: stream.formatSpecificParams))
       }
-      if let s = init_.ssrc { videoSsrc = s }
-    }
+      videoClockRate = stream.clockRateHz
 
-    let timeline = try Timeline(start: videoStart, clockRate: stream.clockRateHz)
-    inorderParsers[videoIdx] = InorderParser(
-      ssrc: videoSsrc, nextSeq: videoSeq, isTcp: transport == .tcp,
-      timeline: timeline, onDiagnostic: onDiagnostic)
+      var videoStart: UInt32?
+      var videoSeq: UInt16?
+      var videoSsrc: UInt32? = videoSetupSSRC
+
+      if case .setup(let init_) = presMut.streams[videoIdx].state {
+        videoStart = init_.initialRtptime
+        if let seq = init_.initialSeq, seq != 0, seq != 1 {
+          videoSeq = seq
+        }
+        if let s = init_.ssrc { videoSsrc = s }
+      }
+
+      let timeline = try Timeline(start: videoStart, clockRate: stream.clockRateHz)
+      inorderParsers[videoIdx] = InorderParser(
+        ssrc: videoSsrc, nextSeq: videoSeq, isTcp: transport == .tcp,
+        timeline: timeline, onDiagnostic: onDiagnostic)
+    }
 
     // Initialize audio depacketizer and inorder parser
     var resolvedAudioCodec: PublicAudioCodec?
@@ -543,6 +581,22 @@ actor SessionState {
           from: audioStream.encodingName)
         resolvedAudioRate = audioStream.clockRateHz
         resolvedAudioChannels = audioStream.channels
+      } else {
+        // Audio SETUP succeeded but the depacketizer rejected the format
+        // (e.g. malformed AAC fmtp). Null the audio state so packets on
+        // that interleaved channel are silently dropped instead of
+        // misrouted, and so `SessionDescription.audio` is `nil` (matching
+        // reality). Mirrors the metadata-init failure path below.
+        onDiagnostic?(
+          RTSPDiagnostic(
+            severity: .warning,
+            message:
+              "Audio depacketizer init failed for "
+              + "\(audioStream.encodingName); audio will not be delivered."))
+        audioStreamIndex = nil
+        audioEncodingName = nil
+        audioClockRate = nil
+        audioChannels = nil
       }
     }
 
@@ -584,46 +638,70 @@ actor SessionState {
       }
     }
 
+    // Post-init gate. The pre-PLAY gate above caught the case where no
+    // stream was supported, but audio and metadata depacketizer init run
+    // *after* PLAY and can null their own indices on failure (malformed
+    // AAC fmtp, broken Timeline clock rate, etc.). Re-check here so the
+    // documented "at least one usable stream" invariant holds at the
+    // return site too. PLAY has already been sent; the caller will tear
+    // down via `stop()` after we throw.
+    if videoStreamIndex == nil && audioStreamIndex == nil && applicationStreamIndex == nil {
+      throw RTSPError.sessionSetupFailed(
+        statusCode: 0,
+        reason:
+          "All stream depacketizers failed to initialize after PLAY; "
+          + "session has no usable streams.")
+    }
+
     isPlaying = true
 
-    // Build session description
-    let isH265 = stream.encodingName == "h265"
-    let sps: Data
-    let pps: Data
-    var vps: Data?
-    let dims: (width: UInt16, height: UInt16)?
-    if let depkt = depacketizer {
+    // Build session description. `video` is nil when no video stream was
+    // set up; consumers branch on `desc.video != nil` to discover availability.
+    // `depacketizer` and `videoClockRate` are set in lock-step inside the
+    // video-init block above, so the outer `if let` enforces that invariant.
+    let video: VideoStream?
+    if let depkt = depacketizer, let clockRate = videoClockRate {
       switch depkt {
       case .h264(let d):
-        sps = d.parameters?.spsNAL ?? Data()
-        pps = d.parameters?.ppsNAL ?? Data()
-        dims = d.parameters?.genericParameters.pixelDimensions
+        let dims = d.parameters?.genericParameters.pixelDimensions
+        video = VideoStream(
+          codec: .h264,
+          clockRate: clockRate,
+          sps: d.parameters?.spsNAL,
+          pps: d.parameters?.ppsNAL,
+          vps: nil,
+          resolution: dims.map { (width: Int($0.width), height: Int($0.height)) }
+        )
       case .h265(let d):
-        sps = d.parameters?.spsNAL ?? Data()
-        pps = d.parameters?.ppsNAL ?? Data()
-        vps = d.parameters?.vpsNAL
-        dims = d.parameters?.genericParameters.pixelDimensions
+        let dims = d.parameters?.genericParameters.pixelDimensions
+        video = VideoStream(
+          codec: .h265,
+          clockRate: clockRate,
+          sps: d.parameters?.spsNAL,
+          pps: d.parameters?.ppsNAL,
+          vps: d.parameters?.vpsNAL,
+          resolution: dims.map { (width: Int($0.width), height: Int($0.height)) }
+        )
       }
     } else {
-      sps = Data()
-      pps = Data()
-      dims = nil
+      video = nil
     }
-    let resolution = dims.map {
-      (width: Int($0.width), height: Int($0.height))
+
+    let audio: AudioStream?
+    if let codec = resolvedAudioCodec, let rate = resolvedAudioRate {
+      audio = AudioStream(
+        codec: codec,
+        sampleRate: rate,
+        channels: resolvedAudioChannels,
+        extraData: audioDepacketizer?.audioParameters?.extraData
+      )
+    } else {
+      audio = nil
     }
 
     return SessionDescription(
-      videoCodec: isH265 ? .h265 : .h264,
-      sps: sps,
-      pps: pps,
-      vps: vps,
-      resolution: resolution,
-      clockRate: stream.clockRateHz,
-      audioCodec: resolvedAudioCodec,
-      audioSampleRate: resolvedAudioRate,
-      audioChannels: resolvedAudioChannels,
-      audioExtraData: audioDepacketizer?.audioParameters?.extraData,
+      video: video,
+      audio: audio,
       metadataEncoding: applicationEncodingName
     )
   }
@@ -878,25 +956,6 @@ actor SessionState {
     )
   }
 
-  private func isAudioEncodingSupported(_ name: String) -> Bool {
-    switch name {
-    case "mpeg4-generic", "pcmu", "pcma", "l16", "g722", "g723",
-      "u8", "dvi4", "g726-16", "g726-24", "g726-32", "g726-40":
-      return true
-    default:
-      return false
-    }
-  }
-
-  private func isApplicationEncodingSupported(_ name: String) -> Bool {
-    switch name {
-    case "vnd.onvif.metadata":
-      return true
-    default:
-      return false
-    }
-  }
-
   private func publicAudioCodec(from encoding: String) -> PublicAudioCodec {
     switch encoding {
     case "mpeg4-generic": return .aac
@@ -907,5 +966,41 @@ actor SessionState {
     case "l16": return .l16
     default: return .other(encoding)
     }
+  }
+}
+
+// MARK: - Encoding-support predicates (free functions, testable)
+
+/// True iff `RTSPClientSession` can depacketize a video stream advertising
+/// this SDP `a=rtpmap` encoding name.
+func isVideoEncodingSupported(_ name: String) -> Bool {
+  switch name {
+  case "h264", "h265":
+    return true
+  default:
+    return false
+  }
+}
+
+/// True iff `RTSPClientSession` can depacketize an audio stream advertising
+/// this SDP `a=rtpmap` encoding name.
+func isAudioEncodingSupported(_ name: String) -> Bool {
+  switch name {
+  case "mpeg4-generic", "pcmu", "pcma", "l16", "g722", "g723",
+    "u8", "dvi4", "g726-16", "g726-24", "g726-32", "g726-40":
+    return true
+  default:
+    return false
+  }
+}
+
+/// True iff `RTSPClientSession` can depacketize an analytics-metadata stream
+/// advertising this SDP `a=rtpmap` encoding name.
+func isApplicationEncodingSupported(_ name: String) -> Bool {
+  switch name {
+  case "vnd.onvif.metadata":
+    return true
+  default:
+    return false
   }
 }
