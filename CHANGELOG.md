@@ -2,9 +2,21 @@
 
 ## Upcoming
 
+### Breaking changes
+
+- `SessionDescription` now groups video and audio fields into `VideoStream?` and `AudioStream?` substructs. Replaces the flat `videoCodec` / `sps` / `pps` / `clockRate` / `audioCodec` / `audioSampleRate` / `audioChannels` / `audioExtraData` fields. A session is valid as long as any one of video, audio, or analytics metadata is set up — audio-only and metadata-only RTSP configurations (e.g. Axis cameras with `video=0`) now work end-to-end. Consumers branch on `desc.video != nil` (or `desc.audio != nil`) before configuring their decoders.
+
+### New
+
+- ONVIF analytics metadata stream support (`vnd.onvif.metadata` per the ONVIF Streaming Specification). Surfaced as `PublicCodecItem.metadata(PublicMetadataFrame)` in the `session.frames()` stream, with discoverability via `SessionDescription.metadataEncoding`. Best-effort: malformed metadata SDP or a failed application SETUP degrades to a diagnostic without aborting video/audio.
+
 ### Improvements
 
 - Add visionOS 1.0 to supported platforms
+
+### Fixes
+
+- Audio depacketizer init failures now null out the audio stream state (index, encoding name, clock rate, channels), mirroring the metadata-init failure path. Previously the indices stayed set while the depacketizer was nil; packets on that channel were silently dropped by the dispatch loop but `SessionDescription` could still claim the stream existed. Required to keep the "at least one usable stream" guard honest in audio-only sessions.
 
 ## 0.2.0
 

@@ -282,23 +282,25 @@ final class CameraViewerDelegate: NSObject, NSApplicationDelegate {
 
     do {
       let desc = try await session.start()
-      let res = desc.resolution.map { "\($0.width)×\($0.height)" } ?? "?"
-      log("Connected: \(desc.videoCodec) \(res)")
+      let res = desc.video?.resolution.map { "\($0.width)×\($0.height)" } ?? "?"
+      let codecLabel = desc.video.map { "\($0.codec)" } ?? "no video"
+      log("Connected: \(codecLabel) \(res)")
 
       await MainActor.run {
-        window.title = "IPCamKit — \(desc.videoCodec) \(res)"
+        window.title = "IPCamKit — \(codecLabel) \(res)"
       }
 
-      if let audioCodec = desc.audioCodec, let audioRate = desc.audioSampleRate {
+      if let audio = desc.audio {
         audioPlayer.start(
-          codec: audioCodec, sampleRate: Double(audioRate),
-          channels: UInt32(desc.audioChannels ?? 1))
+          codec: audio.codec, sampleRate: Double(audio.sampleRate),
+          channels: UInt32(audio.channels ?? 1))
       }
 
-      var fmtDesc = try makeFormatDescription(
-        codec: desc.videoCodec,
-        sps: desc.sps, pps: desc.pps, vps: desc.vps
-      )
+      var fmtDesc: CMVideoFormatDescription?
+      if let video = desc.video, let sps = video.sps, let pps = video.pps {
+        fmtDesc = try makeFormatDescription(
+          codec: video.codec, sps: sps, pps: pps, vps: video.vps)
+      }
 
       let layer = layerRef.layer
       var receivedKeyframe = false
@@ -311,9 +313,10 @@ final class CameraViewerDelegate: NSObject, NSApplicationDelegate {
           audioPlayer.enqueue(audioFrame)
 
         case .video(let frame):
+          guard let video = desc.video else { continue }
           if let newSPS = frame.sps, let newPPS = frame.pps {
             fmtDesc = try makeFormatDescription(
-              codec: desc.videoCodec,
+              codec: video.codec,
               sps: newSPS, pps: newPPS, vps: frame.vps
             )
           }
@@ -323,9 +326,11 @@ final class CameraViewerDelegate: NSObject, NSApplicationDelegate {
             receivedKeyframe = true
           }
 
-          if let sample = buildSampleBuffer(
-            frame, codec: desc.videoCodec, formatDescription: fmtDesc
-          ) {
+          if let fmt = fmtDesc,
+            let sample = buildSampleBuffer(
+              frame, codec: video.codec, formatDescription: fmt
+            )
+          {
             if layer.status == .failed { layer.flush() }
             layer.enqueue(sample)
           }

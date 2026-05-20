@@ -5,6 +5,7 @@ A pure-Swift RTSP client library for streaming live video and audio from IP came
 - **H.264 and H.265/HEVC video** — depacketized to AVCC format, ready for VideoToolbox
 - **Audio** — AAC, PCMU, PCMA, G.722, G.726, L16, G.723.1
 - **ONVIF analytics metadata** — raw XML documents from the camera's `application` RTSP stream
+- **Optional streams** — any combination of video / audio / metadata is supported; audio-only or metadata-only sessions (e.g. Axis `video=0`) work end-to-end
 - **Zero dependencies** — only Foundation, Network, and CryptoKit
 - **Swift 6** — strict concurrency with async/await and AsyncThrowingStream
 
@@ -45,9 +46,13 @@ let session = RTSPClientSession(
 
 // Connect and get stream metadata
 let desc = try await session.start()
-// desc.videoCodec, desc.resolution, desc.sps, desc.pps, desc.vps
-// desc.audioCodec, desc.audioSampleRate, desc.audioChannels
-// desc.metadataEncoding — non-nil if an ONVIF metadata stream is active
+// desc.video, desc.audio, desc.metadataEncoding — at least one is non-nil
+//   desc.video?.codec / .clockRate / .sps / .pps / .vps / .resolution
+//   desc.audio?.codec / .sampleRate / .channels / .extraData
+
+if let video = desc.video {
+    // configure a video decoder (VideoToolbox, etc.)
+}
 
 // Consume depacketized frames
 for try await item in session.frames() {

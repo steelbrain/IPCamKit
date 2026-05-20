@@ -10,7 +10,9 @@ let session = RTSPClientSession(
   credentials: Credentials(username: "admin", password: "pass"))
 
 let desc = try await session.start()
-// desc.videoCodec, desc.resolution, desc.audioCodec, etc.
+// desc.video?.codec / .resolution / .sps / .pps / .vps / .clockRate
+// desc.audio?.codec / .sampleRate / .channels / .extraData
+// desc.metadataEncoding (e.g. "vnd.onvif.metadata")
 
 for try await item in session.frames() {
   switch item {
@@ -18,6 +20,8 @@ for try await item in session.frames() {
     // frame.nalus — AVCC NAL units for VideoToolbox
   case .audio(let frame):
     // frame.data — raw audio (PCMA/PCMU/AAC/etc.)
+  case .metadata(let frame):
+    // frame.data — ONVIF analytics XML (possibly GZIP-compressed)
   case .rtcp:
     break
   }
@@ -82,19 +86,29 @@ enum Transport: Sendable {
 
 Returned by `start()` with stream metadata parsed from SDP.
 
+At least one of `video`, `audio`, or `metadataEncoding` is non-`nil`; a session with zero usable streams is rejected at `start()`.
+
 ```swift
 struct SessionDescription: Sendable {
-  let videoCodec: VideoCodec
-  let sps: Data
-  let pps: Data
+  let video: VideoStream?
+  let audio: AudioStream?
+  let metadataEncoding: String?                // e.g. "vnd.onvif.metadata"
+}
+
+struct VideoStream: Sendable {
+  let codec: VideoCodec
+  let clockRate: UInt32
+  let sps: Data?                               // nil until parameters observed
+  let pps: Data?
   let vps: Data?                               // H.265 only
   let resolution: (width: Int, height: Int)?
-  let clockRate: UInt32
+}
 
-  let audioCodec: PublicAudioCodec?
-  let audioSampleRate: UInt32?
-  let audioChannels: UInt16?
-  let audioExtraData: Data?                    // e.g. AudioSpecificConfig for AAC
+struct AudioStream: Sendable {
+  let codec: PublicAudioCodec
+  let sampleRate: UInt32                       // Hz
+  let channels: UInt16?
+  let extraData: Data?                         // e.g. AudioSpecificConfig for AAC
 }
 ```
 
@@ -129,6 +143,7 @@ enum PublicAudioCodec: Sendable {
 enum PublicCodecItem: Sendable {
   case video(PublicVideoFrame)
   case audio(PublicAudioFrame)
+  case metadata(PublicMetadataFrame)
   case rtcp(PublicRTCPPacket)
 }
 ```
@@ -160,6 +175,19 @@ struct PublicAudioFrame: Sendable {
   let codec: PublicAudioCodec
   let sampleRate: UInt32    // Hz
   let channels: UInt16?
+  let loss: UInt16          // RTP packets lost before this frame
+}
+```
+
+### PublicMetadataFrame
+
+Raw payload from an analytics-metadata RTP stream (e.g. ONVIF XML, possibly GZIP-compressed). Consumers handle decoding based on `encodingName`.
+
+```swift
+struct PublicMetadataFrame: Sendable {
+  let data: Data            // Raw payload (depacketized across RTP fragments)
+  let timestamp: Double     // Presentation timestamp in seconds
+  let encodingName: String  // e.g. "vnd.onvif.metadata"
   let loss: UInt16          // RTP packets lost before this frame
 }
 ```
