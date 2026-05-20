@@ -132,7 +132,7 @@ Sources/IPCamKit/
 
 ## Testing
 
-103 tests across 16 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and integration:
+100+ tests across 15+ suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and integration:
 
 ```bash
 swift test
