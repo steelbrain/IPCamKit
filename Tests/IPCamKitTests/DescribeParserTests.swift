@@ -686,4 +686,130 @@ struct DescribeParserTests {
     #expect(setup.source == nil)
     #expect(setup.serverPort == 49152)
   }
+
+  // MARK: - Video-less stream configurations (Axis `video=0`)
+
+  @Test("Axis audio-only SDP (no video stream)")
+  func axisAudioOnlySDP() throws {
+    let p = try loadDescribe(url: "rtsp://127.0.0.1/", filename: "axis_audio_only_sdp.txt")
+    #expect(p.streams.count == 1)
+    let s0 = p.streams[0]
+    #expect(s0.media == "audio")
+    #expect(s0.encodingName == "mpeg4-generic")
+    #expect(s0.clockRateHz == 16000)
+    #expect(s0.channels == 1)
+    #expect(p.streams.contains(where: { $0.media == "video" }) == false)
+  }
+
+  @Test("Axis metadata-only SDP (no video or audio)")
+  func axisMetadataOnlySDP() throws {
+    let p = try loadDescribe(url: "rtsp://127.0.0.1/", filename: "axis_metadata_only_sdp.txt")
+    #expect(p.streams.count == 1)
+    let s0 = p.streams[0]
+    #expect(s0.media == "application")
+    #expect(s0.encodingName == "vnd.onvif.metadata")
+    #expect(s0.clockRateHz == 90000)
+    #expect(p.streams.contains(where: { $0.media == "video" }) == false)
+    #expect(p.streams.contains(where: { $0.media == "audio" }) == false)
+  }
+
+  @Test("Axis audio + metadata SDP (no video)")
+  func axisAudioMetadataSDP() throws {
+    let p = try loadDescribe(url: "rtsp://127.0.0.1/", filename: "axis_audio_metadata_sdp.txt")
+    #expect(p.streams.count == 2)
+    #expect(p.streams[0].media == "audio")
+    #expect(p.streams[0].encodingName == "mpeg4-generic")
+    #expect(p.streams[1].media == "application")
+    #expect(p.streams[1].encodingName == "vnd.onvif.metadata")
+    #expect(p.streams.contains(where: { $0.media == "video" }) == false)
+  }
+
+  // MARK: - Encoding-support predicates
+
+  @Test("Video encoding support predicate")
+  func videoEncodingSupport() {
+    #expect(isVideoEncodingSupported("h264"))
+    #expect(isVideoEncodingSupported("h265"))
+    #expect(!isVideoEncodingSupported("jpeg"))
+    #expect(!isVideoEncodingSupported("vp8"))
+    #expect(!isVideoEncodingSupported(""))
+  }
+
+  @Test("Audio encoding support predicate")
+  func audioEncodingSupport() {
+    #expect(isAudioEncodingSupported("mpeg4-generic"))
+    #expect(isAudioEncodingSupported("pcma"))
+    #expect(isAudioEncodingSupported("pcmu"))
+    #expect(isAudioEncodingSupported("l16"))
+    #expect(isAudioEncodingSupported("g722"))
+    #expect(isAudioEncodingSupported("g723"))
+    #expect(isAudioEncodingSupported("g726-32"))
+    #expect(!isAudioEncodingSupported("opus"))
+    #expect(!isAudioEncodingSupported("speex"))
+    #expect(!isAudioEncodingSupported(""))
+  }
+
+  @Test("Application encoding support predicate")
+  func applicationEncodingSupport() {
+    #expect(isApplicationEncodingSupported("vnd.onvif.metadata"))
+    #expect(!isApplicationEncodingSupported("vnd.axis.metadata"))
+    #expect(!isApplicationEncodingSupported("vnd.hikvision.metadata"))
+    #expect(!isApplicationEncodingSupported(""))
+  }
+
+  /// Mirrors the `firstIndex(where:)` filters at the top of `start()`.
+  /// When all three return `nil`, the pre-PLAY "at least one usable stream"
+  /// gate throws `sessionSetupFailed`.
+  private func discoverUsableStreams(
+    _ p: Presentation
+  ) -> (video: Int?, audio: Int?, metadata: Int?) {
+    let v = p.streams.firstIndex {
+      $0.media == "video" && isVideoEncodingSupported($0.encodingName)
+    }
+    let a = p.streams.firstIndex {
+      $0.media == "audio" && isAudioEncodingSupported($0.encodingName)
+    }
+    let m = p.streams.firstIndex {
+      $0.media == "application" && isApplicationEncodingSupported($0.encodingName)
+    }
+    return (v, a, m)
+  }
+
+  @Test("SDP with only unsupported encodings leaves all stream slots empty")
+  func unsupportedEncodingsSDP() throws {
+    let p = try loadDescribe(
+      url: "rtsp://127.0.0.1/", filename: "unsupported_encodings_sdp.txt")
+    // Parser tolerates the SDP (3 streams advertised, all unsupported).
+    #expect(p.streams.count == 3)
+    #expect(p.streams[0].encodingName == "jpeg")
+    #expect(p.streams[1].encodingName == "opus")
+    #expect(p.streams[2].encodingName == "vnd.axis.metadata")
+
+    // None of the three would survive the encoding-support filters in
+    // `start()` — so the pre-PLAY gate would throw `sessionSetupFailed`.
+    let usable = discoverUsableStreams(p)
+    #expect(usable.video == nil)
+    #expect(usable.audio == nil)
+    #expect(usable.metadata == nil)
+  }
+
+  @Test("Axis audio-only SDP yields only the audio slot")
+  func axisAudioOnlyUsableStreams() throws {
+    let p = try loadDescribe(
+      url: "rtsp://127.0.0.1/", filename: "axis_audio_only_sdp.txt")
+    let usable = discoverUsableStreams(p)
+    #expect(usable.video == nil)
+    #expect(usable.audio != nil)
+    #expect(usable.metadata == nil)
+  }
+
+  @Test("Axis metadata-only SDP yields only the metadata slot")
+  func axisMetadataOnlyUsableStreams() throws {
+    let p = try loadDescribe(
+      url: "rtsp://127.0.0.1/", filename: "axis_metadata_only_sdp.txt")
+    let usable = discoverUsableStreams(p)
+    #expect(usable.video == nil)
+    #expect(usable.audio == nil)
+    #expect(usable.metadata != nil)
+  }
 }

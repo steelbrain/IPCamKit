@@ -1,0 +1,14 @@
+v=0
+o=- 1620251477190769 1620251477190769 IN IP4 192.168.1.50
+s=Media Presentation
+e=NONE
+c=IN IP4 0.0.0.0
+b=AS:50
+t=0 0
+a=control:rtsp://192.168.1.50:554/axis-media/media.amp/?video=0&audio=0&event=on
+a=range:npt=0-
+m=application 0 RTP/AVP 107
+b=AS:50
+a=recvonly
+a=control:rtsp://192.168.1.50:554/axis-media/media.amp/trackID=3
+a=rtpmap:107 vnd.onvif.metadata/90000
