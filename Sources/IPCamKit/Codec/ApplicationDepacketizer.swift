@@ -47,6 +47,7 @@ struct ApplicationDepacketizer: Sendable {
   }
 
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
+    precondition(ready == nil, "push() called before pull() drained the previous frame")
     pendingLoss = pendingLoss + UInt32(pkt.loss)
 
     var skipAppend = false
@@ -54,6 +55,7 @@ struct ApplicationDepacketizer: Sendable {
     if pkt.loss > 0 && !buffer.isEmpty {
       // Lost a packet mid-document — the buffered prefix is unusable.
       buffer.removeAll(keepingCapacity: true)
+      lastTimestamp = nil
       dropUntilMark = true
     }
 
@@ -68,6 +70,7 @@ struct ApplicationDepacketizer: Sendable {
         warnedSinceMark = true
       }
       buffer.removeAll(keepingCapacity: true)
+      lastTimestamp = nil
       dropUntilMark = true
       skipAppend = true
     }
@@ -85,6 +88,7 @@ struct ApplicationDepacketizer: Sendable {
     // marker on an empty payload). Carry `pendingLoss` forward.
     if dropUntilMark || buffer.isEmpty {
       buffer.removeAll(keepingCapacity: true)
+      lastTimestamp = nil
       dropUntilMark = false
       warnedSinceMark = false
       return
@@ -94,6 +98,7 @@ struct ApplicationDepacketizer: Sendable {
     // `buffer` is non-empty — so the guard is unreachable in practice.
     guard let ts = lastTimestamp else {
       buffer.removeAll(keepingCapacity: true)
+      dropUntilMark = false
       warnedSinceMark = false
       return
     }

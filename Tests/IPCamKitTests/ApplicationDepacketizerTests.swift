@@ -107,6 +107,22 @@ struct ApplicationDepacketizerTests {
     #expect(frame?.data == Data("b".utf8))
   }
 
+  @Test("Loss on the marker packet with a non-empty prefix drops the doc")
+  func lossOnMarkerWithPrefix() throws {
+    var d = ApplicationDepacketizer()
+    try d.push(makeMetadataPacket(seq: 0, timestamp: 1000, mark: false, payload: Data("aaa".utf8)))
+    // Marker packet itself carries loss > 0 — the prefix is unusable and
+    // we can't trust the marker packet's payload either.
+    try d.push(
+      makeMetadataPacket(seq: 2, timestamp: 1000, mark: true, loss: 2, payload: Data("bbb".utf8)))
+    #expect(d.pull() == nil)
+    // Loss is carried to the next clean document.
+    try d.push(makeMetadataPacket(seq: 3, timestamp: 2000, mark: true, payload: Data("ok".utf8)))
+    let frame = pullFrame(&d)
+    #expect(frame?.loss == 2)
+    #expect(frame?.data == Data("ok".utf8))
+  }
+
   @Test("Mid-document loss discards prefix and carries loss to next clean frame")
   func midDocumentLossDiscards() throws {
     var d = ApplicationDepacketizer()

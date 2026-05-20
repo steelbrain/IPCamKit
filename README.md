@@ -47,6 +47,7 @@ let session = RTSPClientSession(
 let desc = try await session.start()
 // desc.videoCodec, desc.resolution, desc.sps, desc.pps, desc.vps
 // desc.audioCodec, desc.audioSampleRate, desc.audioChannels
+// desc.metadataEncoding — non-nil if an ONVIF metadata stream is active
 
 // Consume depacketized frames
 for try await item in session.frames() {

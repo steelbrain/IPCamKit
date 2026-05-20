@@ -68,6 +68,10 @@ public struct SessionDescription: Sendable {
   public let audioChannels: UInt16?
   /// Codec-specific extra data (e.g. AudioSpecificConfig for AAC).
   public let audioExtraData: Data?
+
+  /// SDP encoding name of the analytics-metadata stream if one was set up
+  /// (e.g. `vnd.onvif.metadata`), or `nil` if no metadata stream is active.
+  public let metadataEncoding: String?
 }
 
 /// RTSP client session that manages the full RTSP lifecycle.
@@ -397,13 +401,16 @@ actor SessionState {
     }
 
     // Find and SETUP application (metadata) stream — optional, best-effort.
-    let applicationIdx = presMut.streams.firstIndex(where: { s in
+    // If SETUP fails (camera advertises the stream but rejects it, or any
+    // transport error), disable metadata locally rather than aborting the
+    // session. The channel slot stays assigned (no other streams follow).
+    var applicationIdx = presMut.streams.firstIndex(where: { s in
       s.media == "application" && isApplicationEncodingSupported(s.encodingName)
     })
     var applicationSetupSSRC: UInt32?
 
-    if let applicationIdx = applicationIdx {
-      let applicationStream = presMut.streams[applicationIdx]
+    if let idx = applicationIdx {
+      let applicationStream = presMut.streams[idx]
       let applicationSetupURL = applicationStream.control ?? url
       var applicationSetupHeaders: [(String, String)] = []
       if transport == .tcp {
@@ -414,34 +421,45 @@ actor SessionState {
             "RTP/AVP/TCP;unicast;interleaved=\(applicationChannelId)-\(applicationChannelId + 1)"
           ))
         try channelMappings.assign(
-          channelId: applicationChannelId, streamIndex: applicationIdx)
+          channelId: applicationChannelId, streamIndex: idx)
       } else {
         applicationSetupHeaders.append(("Transport", "RTP/AVP;unicast"))
       }
       if let sid = sessionId {
         applicationSetupHeaders.append(("Session", sid))
       }
-      let applicationSetupResp = try await sendRequest(
-        method: .setup, url: applicationSetupURL,
-        extraHeaders: applicationSetupHeaders)
-      let applicationSetup = try parseSetup(response: applicationSetupResp)
-      if let prev = sessionId, prev != applicationSetup.session.id {
+
+      do {
+        let applicationSetupResp = try await sendRequest(
+          method: .setup, url: applicationSetupURL,
+          extraHeaders: applicationSetupHeaders)
+        let applicationSetup = try parseSetup(response: applicationSetupResp)
+        if let prev = sessionId, prev != applicationSetup.session.id {
+          onDiagnostic?(
+            RTSPDiagnostic(
+              severity: .warning,
+              message:
+                "Camera issued a new Session ID at application SETUP "
+                + "(\(prev) -> \(applicationSetup.session.id)); rolling forward."))
+        }
+        sessionId = applicationSetup.session.id
+        applicationSetupSSRC = applicationSetup.ssrc
+        presMut.streams[idx].state = .setup(
+          StreamStateInit(
+            ssrc: applicationSetup.ssrc, initialSeq: nil,
+            initialRtptime: nil, ctx: .dummy))
+
+        applicationStreamIndex = idx
+        applicationEncodingName = applicationStream.encodingName
+      } catch {
         onDiagnostic?(
           RTSPDiagnostic(
             severity: .warning,
             message:
-              "Camera issued a new Session ID at application SETUP "
-              + "(\(prev) -> \(applicationSetup.session.id)); rolling forward."))
+              "Application SETUP failed: \(error); "
+              + "metadata will not be delivered."))
+        applicationIdx = nil
       }
-      sessionId = applicationSetup.session.id
-      applicationSetupSSRC = applicationSetup.ssrc
-      presMut.streams[applicationIdx].state = .setup(
-        StreamStateInit(
-          ssrc: applicationSetup.ssrc, initialSeq: nil,
-          initialRtptime: nil, ctx: .dummy))
-
-      applicationStreamIndex = applicationIdx
-      applicationEncodingName = applicationStream.encodingName
     }
 
     // PLAY
@@ -605,7 +623,8 @@ actor SessionState {
       audioCodec: resolvedAudioCodec,
       audioSampleRate: resolvedAudioRate,
       audioChannels: resolvedAudioChannels,
-      audioExtraData: audioDepacketizer?.audioParameters?.extraData
+      audioExtraData: audioDepacketizer?.audioParameters?.extraData,
+      metadataEncoding: applicationEncodingName
     )
   }
 
