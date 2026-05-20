@@ -4,6 +4,7 @@ A pure-Swift RTSP client library for streaming live video and audio from IP came
 
 - **H.264 and H.265/HEVC video** — depacketized to AVCC format, ready for VideoToolbox
 - **Audio** — AAC, PCMU, PCMA, G.722, G.726, L16, G.723.1
+- **ONVIF analytics metadata** — raw XML documents from the camera's `application` RTSP stream
 - **Zero dependencies** — only Foundation, Network, and CryptoKit
 - **Swift 6** — strict concurrency with async/await and AsyncThrowingStream
 
@@ -46,6 +47,7 @@ let session = RTSPClientSession(
 let desc = try await session.start()
 // desc.videoCodec, desc.resolution, desc.sps, desc.pps, desc.vps
 // desc.audioCodec, desc.audioSampleRate, desc.audioChannels
+// desc.metadataEncoding — non-nil if an ONVIF metadata stream is active
 
 // Consume depacketized frames
 for try await item in session.frames() {
@@ -58,6 +60,10 @@ for try await item in session.frames() {
     case .audio(let frame):
         // frame.data — raw audio bytes (codec-specific)
         // frame.codec, frame.sampleRate, frame.channels, frame.timestamp
+        break
+    case .metadata(let frame):
+        // frame.data — raw payload (typically ONVIF XML, possibly GZIP-compressed)
+        // frame.encodingName, frame.timestamp, frame.loss
         break
     case .rtcp:
         break
@@ -80,6 +86,11 @@ See [API.md](API.md) for the full API reference.
 ### Audio
 - AAC (RFC 3640) with aggregation and fragmentation
 - PCMU (G.711 u-law), PCMA (G.711 A-law), L16, G.722, G.726, DVI4, G.723.1
+
+### Metadata
+- ONVIF analytics metadata (`vnd.onvif.metadata`) per the ONVIF Streaming Specification
+- Concatenates RTP payload fragments and emits a frame on the marker bit (end-of-document)
+- Best-effort: malformed metadata SDP degrades to a diagnostic without aborting video/audio
 
 ### Protocol
 - RTSP session management (DESCRIBE, SETUP, PLAY, TEARDOWN)
@@ -114,7 +125,7 @@ Sources/IPCamKit/
 ├── RTSP/           RTSP message model, parser, serializer
 ├── SDP/            SDP session description parser (RFC 8866)
 ├── RTP/            RTP/RTCP packets, Timeline, ChannelMapping, InorderParser
-├── Codec/          H.264/H.265 depacketizers, NAL/SPS/PPS parsing, audio depacketizers
+├── Codec/          H.264/H.265 depacketizers, NAL/SPS/PPS parsing, audio + metadata depacketizers
 ├── Auth/           Basic and Digest authentication
 ├── Transport/      NWConnection TCP/UDP transport
 └── Client/         RTSP session, DESCRIBE/SETUP/PLAY parsers, Presentation
@@ -122,7 +133,7 @@ Sources/IPCamKit/
 
 ## Testing
 
-90 tests across 15 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, authentication, and integration:
+100+ tests across 15+ suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and integration:
 
 ```bash
 swift test

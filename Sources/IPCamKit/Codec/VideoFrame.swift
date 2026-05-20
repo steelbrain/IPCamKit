@@ -69,4 +69,5 @@ struct DepacketizeError: Error, Sendable, Equatable, CustomStringConvertible {
 enum CodecItem: Sendable {
   case videoFrame(VideoFrame)
   case audioFrame(AudioFrame)
+  case metadataFrame(MetadataFrame)
 }
