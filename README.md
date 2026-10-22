@@ -21,7 +21,7 @@ Add IPCamKit as a dependency in your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/steelbrain/IPCamKit.git", from: "0.3.1"),
+    .package(url: "https://github.com/steelbrain/IPCamKit.git", from: "0.3.2"),
 ]
 ```
 
