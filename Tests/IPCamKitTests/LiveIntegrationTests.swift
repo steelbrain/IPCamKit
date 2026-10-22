@@ -441,6 +441,38 @@ private func audioFrames(_ items: [PublicCodecItem]) -> [PublicAudioFrame] {
   items.compactMap { if case .audio(let f) = $0 { return f } else { return nil } }
 }
 
+/// Pin the public `PublicVideoFrame.nalus` layout (issue #9): each element is
+/// one raw NAL unit starting with its NAL header, not an AVCC length prefix. A
+/// length-prefixed element would start with 0x00 — H.264 NAL type 0
+/// (unspecified), or an H.265 header with `nuh_temporal_id_plus1` == 0
+/// (forbidden) — and no keyframe would expose its IDR/IRAP NAL type.
+private func expectRawNALUnits(
+  _ frames: [PublicVideoFrame], codec: VideoCodec,
+  sourceLocation: SourceLocation = #_sourceLocation
+) {
+  func nalType(_ nal: Data) -> UInt8? {
+    guard let first = nal.first, first & 0x80 == 0 else { return nil }
+    switch codec {
+    case .h264:
+      let type = first & 0x1F
+      return (1...23).contains(type) ? type : nil
+    case .h265:
+      guard nal.count >= 2, nal[nal.startIndex + 1] & 0x07 != 0 else { return nil }
+      return (first >> 1) & 0x3F
+    }
+  }
+  let keyframeTypes: ClosedRange<UInt8> = codec == .h264 ? 5...5 : 16...21
+  let malformed = frames.flatMap(\.nalus).filter { nalType($0) == nil }
+  #expect(
+    malformed.isEmpty, "every nalus element should start with a NAL header",
+    sourceLocation: sourceLocation)
+  let keyframes = frames.filter(\.isKeyframe)
+  #expect(
+    keyframes.allSatisfy { $0.nalus.contains { nalType($0).map(keyframeTypes.contains) == true } },
+    "every keyframe should carry its IDR/IRAP NAL as a raw element",
+    sourceLocation: sourceLocation)
+}
+
 /// A detached backstop that SIGKILLs any live test server/publisher after `cap`.
 /// This bounds the *whole* test even if an await inside the library is itself
 /// unbounded (e.g. an RTSP read with no timeout while the server stalls):
@@ -509,6 +541,7 @@ struct LiveIntegrationTests {
     #expect(spsAvailable, "expected SPS via SDP or in-band")
     #expect(ppsAvailable, "expected PPS via SDP or in-band")
     #expect(vf.allSatisfy { !$0.nalus.isEmpty }, "every frame should carry NAL units")
+    expectRawNALUnits(vf, codec: .h264)
 
     // Graceful stop during active streaming must return promptly. This guards
     // the control-channel fix: TEARDOWN is routed through the reader loop, so
@@ -616,6 +649,7 @@ struct LiveIntegrationTests {
     #expect(vpsAvailable, "expected VPS via SDP or in-band")
     #expect(spsAvailable, "expected SPS via SDP or in-band")
     #expect(ppsAvailable, "expected PPS via SDP or in-band")
+    expectRawNALUnits(vf, codec: .h265)
   }
 
   @Test("H.264 + AAC over interleaved TCP yields video and 48 kHz audio")

@@ -7,6 +7,11 @@
 - Only include `algorithm=` in the RTSP Digest `Authorization` header when the
   camera's challenge specified one. Since 0.3.0 it was always sent (defaulting
   to `MD5`), which Reolink cameras (e.g. TrackMix PoE) reject with 401.
+- Correct the `PublicVideoFrame.nalus` documentation (#9). Each element is one
+  raw NAL unit with no AVCC length prefix, which is what the API has always
+  returned; it was documented as length-prefixed. To build a VideoToolbox
+  sample, write each NAL's 4-byte big-endian length before it. Runtime
+  behavior is unchanged.
 
 ## 0.3.1
 

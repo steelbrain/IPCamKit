@@ -2,7 +2,7 @@
 
 A pure-Swift RTSP client library for streaming live video and audio from IP cameras.
 
-- **H.264 and H.265/HEVC video** — depacketized to AVCC format, ready for VideoToolbox
+- **H.264 and H.265/HEVC video** — depacketized into individual NAL units for VideoToolbox
 - **Audio** — AAC, PCMU, PCMA, G.722, G.726, L16, G.723.1
 - **ONVIF analytics metadata** — raw XML documents from the camera's `application` RTSP stream
 - **Optional streams** — any combination of video / audio / metadata is supported; audio-only or metadata-only sessions (e.g. Axis `video=0`) work end-to-end
@@ -59,7 +59,8 @@ if let video = desc.video {
 for try await item in session.frames() {
     switch item {
     case .video(let frame):
-        // frame.nalus — AVCC-format NAL units (ready for VideoToolbox)
+        // frame.nalus — raw NAL units; prefix each with its 4-byte
+        //   big-endian length to build a VideoToolbox sample
         // frame.isKeyframe, frame.timestamp, frame.loss
         // frame.sps, frame.pps, frame.vps — non-nil when parameters change
         break
@@ -87,7 +88,7 @@ See [API.md](API.md) for the full API reference.
 ### Video
 - H.264 depacketization (RFC 6184): Single NAL, FU-A, STAP-A
 - H.265/HEVC depacketization (RFC 7798): Single NAL, AP, FU (SRST mode)
-- Output in AVCC format (4-byte length-prefixed NAL units) ready for VideoToolbox
+- Output as raw NAL units, one per array element (no length prefixes or start codes)
 
 ### Audio
 - AAC (RFC 3640) with aggregation and fragmentation

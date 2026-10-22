@@ -101,7 +101,7 @@ public struct SessionDescription: Sendable {
 /// let desc = try await session.start()
 /// for try await item in session.frames() {
 ///     switch item {
-///     case .video(let frame): _ = frame.nalus  // AVCC NAL units
+///     case .video(let frame): _ = frame.nalus  // raw NAL units
 ///     case .audio, .metadata, .rtcp: break
 ///     }
 /// }
@@ -166,7 +166,8 @@ public final class RTSPClientSession: Sendable {
 
   /// Stream of depacketized video frames.
   ///
-  /// Each frame contains NAL units in AVCC format (4-byte length prefix).
+  /// Each video frame carries its NAL units as raw NAL bytes, one per element,
+  /// with no length prefix (see `PublicVideoFrame.nalus`).
   /// SPS/PPS changes are signaled via `sps`/`pps` properties on the frame.
   public func frames() -> AsyncThrowingStream<PublicCodecItem, Error> {
     AsyncThrowingStream { continuation in
@@ -244,7 +245,10 @@ public struct PublicMetadataFrame: Sendable {
 
 /// A video frame exposed to consumers.
 public struct PublicVideoFrame: Sendable {
-  /// NAL units in AVCC format (4-byte big-endian length prefix + NAL bytes).
+  /// The frame's NAL units, one raw NAL per element, starting with the NAL
+  /// header. No AVCC length prefix or Annex B start code is included: to build
+  /// a VideoToolbox sample, write each element's length as a 4-byte big-endian
+  /// integer before it. Parameter sets sent in-band appear here as well.
   public let nalus: [Data]
 
   /// Presentation timestamp derived from RTP timestamp.

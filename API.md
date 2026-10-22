@@ -17,7 +17,7 @@ let desc = try await session.start()
 for try await item in session.frames() {
   switch item {
   case .video(let frame):
-    // frame.nalus — AVCC NAL units for VideoToolbox
+    // frame.nalus — raw NAL units (no length prefix)
   case .audio(let frame):
     // frame.data — raw audio (PCMA/PCMU/AAC/etc.)
   case .metadata(let frame):
@@ -161,11 +161,14 @@ enum PublicCodecItem: Sendable {
 
 ### PublicVideoFrame
 
-NAL units in AVCC format (4-byte big-endian length prefix), ready for VideoToolbox.
+One raw NAL unit per `nalus` element, starting with the NAL header: no AVCC
+length prefix and no Annex B start code. To build a VideoToolbox sample, write
+each NAL's length as a 4-byte big-endian integer before it, as
+`Examples/CameraViewer` does. Parameter sets sent in-band appear in `nalus` too.
 
 ```swift
 struct PublicVideoFrame: Sendable {
-  let nalus: [Data]         // NAL units (AVCC format)
+  let nalus: [Data]         // Raw NAL units, no length prefix
   let timestamp: Double     // Presentation timestamp in seconds
   let isKeyframe: Bool      // IDR frame
   let loss: UInt16          // RTP packets lost before this frame
