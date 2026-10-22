@@ -266,6 +266,7 @@ final class LiveStreamFixture: @unchecked Sendable {
       hls: false
       webrtc: false
       srt: false
+      moq: false
       rtsp: true
       rtspTransports: [\(transports.joined(separator: ", "))]
       rtspAddress: '\(family.mediamtxAddress(ports.rtsp))'
