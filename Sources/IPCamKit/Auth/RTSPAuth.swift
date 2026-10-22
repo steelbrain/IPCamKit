@@ -102,7 +102,10 @@ struct RTSPAuthenticator: Sendable {
     var nonce: String
     var qop: String?
     var opaque: String?
-    var algorithm: String
+    /// The challenge's `algorithm` token, or nil when the server omitted it
+    /// (which means MD5). Kept optional so the response only echoes it back
+    /// when the server actually sent one.
+    var algorithm: String?
     var nc: UInt32 = 0
   }
 
@@ -111,7 +114,7 @@ struct RTSPAuthenticator: Sendable {
     var nonce = ""
     var qop: String?
     var opaque: String?
-    var algorithm = "MD5"
+    var algorithm: String?
 
     for param in splitAuthParams(params) {
       let kv = param.split(separator: "=", maxSplits: 1)
@@ -170,7 +173,7 @@ struct RTSPAuthenticator: Sendable {
 
   private mutating func generateDigestAuth(method: String, uri: String) -> String {
     guard var state = digestState else { return generateBasicAuth() }
-    let (hash, sess) = parseAlgorithm(state.algorithm)
+    let (hash, sess) = parseAlgorithm(state.algorithm ?? "MD5")
     let cnonce = generateCNonce()
 
     var ha1 = hashHex(hash, "\(credentials.username):\(state.realm):\(credentials.password)")
@@ -184,7 +187,13 @@ struct RTSPAuthenticator: Sendable {
     // they are RFC tokens, not quoted-strings.
     var header =
       "Digest username=\(quote(credentials.username)), realm=\(quote(state.realm)), "
-      + "nonce=\(quote(state.nonce)), uri=\(quote(uri)), algorithm=\(state.algorithm)"
+      + "nonce=\(quote(state.nonce)), uri=\(quote(uri))"
+    // Echo `algorithm` only when the challenge carried one (as curl and ffmpeg
+    // do). Reolink cameras omit it from the challenge and reject a response
+    // that includes it, even `algorithm=MD5`.
+    if let algorithm = state.algorithm {
+      header += ", algorithm=\(algorithm)"
+    }
 
     if let qop = state.qop, qopOffersAuth(qop) {
       state.nc &+= 1

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2
+
+### Fixes
+
+- Only include `algorithm=` in the RTSP Digest `Authorization` header when the
+  camera's challenge specified one. Since 0.3.0 it was always sent (defaulting
+  to `MD5`), which Reolink cameras (e.g. TrackMix PoE) reject with 401.
+
 ## 0.3.1
 
 ### Fixes

@@ -120,6 +120,32 @@ struct RTSPAuthTests {
     }
   }
 
+  @Test("Digest omits algorithm when the challenge did not specify one")
+  func digestOmitsUnspecifiedAlgorithm() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "user", password: "pass"))
+    // Reolink's challenge: no algorithm, no qop. The camera rejects a response
+    // carrying `algorithm=MD5`, so it must be left out (absent means MD5).
+    auth.handleChallenge("Digest realm=\"BC Streaming Media\", nonce=\"abc123\"")
+
+    let header = auth.authorize(method: "DESCRIBE", uri: "rtsp://host/path")
+    #expect(header != nil)
+    #expect(!header!.contains("algorithm="))
+    // MD5(MD5("user:BC Streaming Media:pass"):abc123:MD5("DESCRIBE:rtsp://host/path"))
+    #expect(header!.contains("response=\"0f3905dab57f4f7c52265c53b5003324\""))
+  }
+
+  @Test("Digest echoes algorithm when the challenge specified it")
+  func digestEchoesSpecifiedAlgorithm() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "user", password: "pass"))
+    auth.handleChallenge("Digest realm=\"test\", nonce=\"abc123\", algorithm=MD5")
+
+    let header = auth.authorize(method: "DESCRIBE", uri: "rtsp://host/path")
+    #expect(header != nil)
+    #expect(header!.contains("algorithm=MD5"))
+  }
+
   @Test("Digest challenge with empty nonce is rejected")
   func digestEmptyNonceRejected() {
     var auth = RTSPAuthenticator(
