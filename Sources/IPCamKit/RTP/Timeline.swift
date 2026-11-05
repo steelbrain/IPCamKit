@@ -11,9 +11,35 @@ import Foundation
 /// - 32-bit wraparound at 2^32
 /// - Optional enforcement of maximum forward time jumps
 /// - Backward timestamp placement (for RTCP SR)
+/// - Rebasing onto a new RTP source (SSRC change, seek) without a jump
 struct Timeline: Sendable {
   /// Current full 64-bit timestamp.
   private var timestamp: Int64
+
+  /// Added (mod 2^32) to every incoming RTP timestamp. Non-zero after
+  /// `rebase(continuingWith:)` maps a new source's unrelated timestamp base
+  /// onto this timeline.
+  private var offset: UInt32 = 0
+
+  /// True once `advanceTo` has accepted a timestamp.
+  private(set) var hasAdvanced = false
+
+  /// The last few distinct advanced timestamps, oldest first (at most
+  /// `recentLimit`), since the last rebase. The smallest gap between them is
+  /// the frame interval, even with B-frames sent in decoding order.
+  private var recent: [Int64] = []
+  private static let recentLimit = 8
+
+  /// The highest advanced timestamp (valid once `hasAdvanced`). With B-frames,
+  /// sent in decoding order, the latest timestamp can be below it.
+  private var highest: Int64 = 0
+
+  /// The latest end of a frame delivered from this timeline (`noteFrameEnd`),
+  /// or `Int64.min` before any. Audio reaches past `highest`: each frame lasts
+  /// past its own timestamp, and the access units of an aggregated AAC packet
+  /// are timestamped after the packet. Rebasing keeps it, since what was
+  /// delivered stays delivered.
+  private var coveredUntil = Int64.min
 
   /// Clock rate in Hz.
   let clockRate: UInt32
@@ -68,8 +94,110 @@ struct Timeline: Sendable {
       }
     }
 
+    if recent.last != ts.timestamp {
+      if recent.count == Self.recentLimit { recent.removeFirst() }
+      recent.append(ts.timestamp)
+    }
+    highest = hasAdvanced ? max(highest, ts.timestamp) : ts.timestamp
     self.timestamp = ts.timestamp
+    hasAdvanced = true
     return ts
+  }
+
+  /// Seconds after `start` one step past the highest advanced timestamp, or
+  /// at the end of the last delivered frame (`noteFrameEnd`) when that is
+  /// later: where the stream's next frame would have been. The step is the
+  /// frame interval: the smallest gap between the last 8 distinct timestamps,
+  /// at least one tick (so the next frame never repeats the highest
+  /// timestamp) and at most half a second (so a stream that sends rarely,
+  /// like metadata on events, doesn't push a seek's common start far ahead).
+  /// nil before the first `advanceTo`.
+  var nextElapsedSeconds: Double? {
+    guard hasAdvanced, let start else { return nil }
+    let sorted = recent.sorted()
+    let gap = zip(sorted, sorted.dropFirst()).map { $1 - $0 }.min() ?? 0
+    let step = max(1, min(gap, Int64(clockRate) / 2))
+    return Double(max(highest + step, coveredUntil) - Int64(start)) / Double(clockRate)
+  }
+
+  /// Record that a frame delivered from this timeline ends at `end` (its
+  /// `Timestamp.timestamp` plus its duration in ticks). Rebasing and
+  /// `nextElapsedSeconds` then place the next frame no earlier than the
+  /// latest such end, so frames that last past their packet's timestamp
+  /// (audio) aren't overlapped by the frames that follow.
+  mutating func noteFrameEnd(_ end: Int64) {
+    if end > coveredUntil { coveredUntil = end }
+  }
+
+  /// Seconds after `start` that `rtpTimestamp` falls at with the current
+  /// mapping (within 2^31 ticks of the latest timestamp), without advancing.
+  /// Nil before the first `advanceTo`.
+  func elapsedSeconds(at rtpTimestamp: UInt32) -> Double? {
+    guard hasAdvanced, let start else { return nil }
+    let delta = Int32(bitPattern: (rtpTimestamp &+ offset) &- UInt32(truncatingIfNeeded: timestamp))
+    return Double(timestamp + Int64(delta) - Int64(start)) / Double(clockRate)
+  }
+
+  /// Map `rtpTimestamp` to `seconds` after `start`; later timestamps follow
+  /// from there. Used after a seek to put every stream's new playback at the
+  /// same time. A timeline with no `start` yet gets one `seconds` before
+  /// `rtpTimestamp`. The latest timestamp moves to that point, however far
+  /// ahead, so the next `advanceTo(rtpTimestamp)` is a step of 0. Returns
+  /// false (and changes nothing) when `seconds` is behind the highest
+  /// timestamp or the end of the last delivered frame (`noteFrameEnd`), or
+  /// beyond 2^53 ticks.
+  @discardableResult
+  mutating func rebase(mapping rtpTimestamp: UInt32, toElapsedSeconds seconds: Double) -> Bool {
+    guard seconds.isFinite, seconds >= 0 else { return false }
+    let ticks = (seconds * Double(clockRate)).rounded(.up)
+    guard ticks < Double(Int64(1) << 53) else { return false }
+    guard let start else {
+      // Nothing placed yet (`start` is set by the first timestamp placed).
+      let newStart = rtpTimestamp &- UInt32(truncatingIfNeeded: Int64(ticks))
+      offset = 0
+      self.start = newStart
+      timestamp = Int64(newStart) + Int64(ticks)
+      return true
+    }
+    let target = Int64(start) + Int64(ticks)
+    guard target >= max(hasAdvanced ? max(timestamp, highest) : timestamp, coveredUntil) else {
+      return false
+    }
+    offset = UInt32(truncatingIfNeeded: target) &- rtpTimestamp
+    timestamp = target
+    highest = target
+    recent.removeAll()
+    return true
+  }
+
+  /// Continue the timeline with a new RTP source whose timestamps have an
+  /// unrelated (random) base, such as a camera that changed its SSRC.
+  ///
+  /// The new source's `rtpTimestamp` maps to one tick after the highest
+  /// advanced timestamp, or to the end of the last delivered frame
+  /// (`noteFrameEnd`) when that is later, and its later timestamps follow
+  /// from there, so the timeline neither jumps nor goes backwards. `start` is
+  /// unchanged. One tick rather than zero keeps the new source's first frame
+  /// distinct from the old source's last one; the frame end keeps it from
+  /// overlapping audio already delivered (an aggregated AAC packet's access
+  /// units run past its timestamp, and every audio frame lasts past its own).
+  /// A no-op before the first `advanceTo`: until then there is nothing to
+  /// continue from, and an RTP-Info `start` still applies.
+  mutating func rebase(continuingWith rtpTimestamp: UInt32) {
+    guard hasAdvanced else { return }
+    offset = UInt32(truncatingIfNeeded: max(highest &+ 1, coveredUntil)) &- rtpTimestamp
+    // The one-tick gap to the new source isn't a frame interval.
+    recent.removeAll()
+  }
+
+  /// Whether `rtpTimestamp` is more than `seconds` behind the latest advanced
+  /// timestamp (false before the first `advanceTo`). Small steps back are
+  /// normal (B-frames are sent in decoding order); a large one means the
+  /// sender's RTP clock restarted.
+  func isBehind(_ rtpTimestamp: UInt32, bySeconds seconds: UInt32) -> Bool {
+    guard hasAdvanced else { return false }
+    let delta = Int32(bitPattern: (rtpTimestamp &+ offset) &- UInt32(truncatingIfNeeded: timestamp))
+    return Int64(delta) < -Int64(seconds) * Int64(clockRate)
   }
 
   /// Place a timestamp without advancing the timeline.
@@ -87,8 +215,9 @@ struct Timeline: Sendable {
   /// self.timestamp to the incoming rtpTimestamp first, making delta = 0.
   /// This matches upstream ts_and_delta behavior.
   private mutating func timestampAndDelta(
-    _ rtpTimestamp: UInt32
+    _ wireTimestamp: UInt32
   ) throws -> (Timestamp, Int32) {
+    let rtpTimestamp = wireTimestamp &+ offset
     // If start is unset, initialize it to this timestamp
     let effectiveStart: UInt32
     if let s = start {

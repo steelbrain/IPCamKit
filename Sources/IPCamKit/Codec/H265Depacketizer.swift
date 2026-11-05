@@ -20,14 +20,25 @@ struct H265Depacketizer: Sendable {
   /// single-fragment FU, forbidden by RFC 7798 section 4.4.3 but emitted by
   /// some cameras). Tracked so callers can surface it as a diagnostic.
   var seenSingleFragmentFu: Bool
-  /// Running total of buffered NAL-body bytes for the in-progress access unit,
-  /// used to bound memory against a hostile camera (see `maxAccessUnitBytes`).
+  /// Running total of output bytes for the in-progress access unit: each
+  /// buffered NAL's 4-byte length prefix and 2-byte header plus all body bytes.
+  /// Used to bound memory against a hostile camera (see `maxAccessUnitBytes`).
   private var pendingBytes: Int = 0
+  /// Index in `nals` of the last VCL NAL unit (a coded slice segment) of the
+  /// access unit in progress, or nil when it has none yet.
+  private var lastVCLIndex: Int?
 
-  /// Cap on a single accumulated access unit. A hostile camera could otherwise
-  /// stream FU continuations (or same-timestamp NALs) forever and grow memory
-  /// without bound. 16 MiB sits well above any real 4K/8K keyframe.
+  /// Cap on the output size of a single accumulated access unit. A hostile
+  /// camera could otherwise stream FU continuations (or same-timestamp NALs)
+  /// forever and grow memory without bound. 16 MiB sits well above any real
+  /// 4K/8K keyframe.
   private static let maxAccessUnitBytes = 16 << 20
+
+  /// Cap on the NAL units plus body pieces buffered for a single access unit.
+  /// Each costs bookkeeping memory beyond its output bytes, so a flood of tiny
+  /// NALs or fragments would otherwise use several times `maxAccessUnitBytes`.
+  /// A 16 MiB access unit sent in 1,400-byte packets is about 12,000 pieces.
+  static let maxAccessUnitEntries = 1 << 16
 
   init(clockRate: UInt32, formatSpecificParams: String?) throws {
     guard clockRate == 90_000 else {
@@ -42,6 +53,9 @@ struct H265Depacketizer: Sendable {
     self.seenSingleFragmentFu = false
 
     if let fmtp = formatSpecificParams {
+      // A transmission mode with DONL fields can't be depacketized: fail loud.
+      // Bad sprop-* parameter sets only fall back to in-band parameters.
+      try H265Parameters.validateTransmissionMode(fmtp)
       self.parameters = try? H265Parameters.parseFormatSpecificParams(fmtp)
     } else {
       self.parameters = nil
@@ -86,16 +100,34 @@ struct H265Depacketizer: Sendable {
     }
   }
 
+  /// NAL units taken off the end of one access unit to start the next, with
+  /// their body pieces (`nextPieceIdx` relative to `pieces`) and the bytes
+  /// they were charged against the access-unit cap.
+  private struct MovedNALs {
+    var nals: [NALEntry]
+    var pieces: [Data]
+    var bytes: Int
+  }
+
   // MARK: - Public Interface
 
+  /// Take over `other`'s current parameters (the stored VPS, SPS and PPS and
+  /// what was parsed from them), so the next access unit's parameter sets are
+  /// compared against them. Nothing else is copied. A session uses this to
+  /// keep the stream's parameters when it replaces the depacketizer with a
+  /// fresh one built from the SDP, as after a seek.
+  mutating func adoptParameters(from other: Self) {
+    parameters = other.parameters
+  }
+
+  /// Add one packet. A thrown error drops this packet and the rest of its
+  /// access unit (see `discardAccessUnit`); the depacketizer stays usable.
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
     let result = pushInner(pkt)
     if case .failure(let err) = result {
-      // Reset to a clean state so a later push() cannot build on a buffer left
-      // partially mutated by the failed push (matters once errors are
-      // recoverable).
+      // pushInner has already moved to a state that drops the rest of this
+      // access unit; clear the partially mutated buffers it leaves behind.
       resetAccumulation()
-      inputState = .new
       throw err
     }
     if case .preMark = inputState {
@@ -110,19 +142,110 @@ struct H265Depacketizer: Sendable {
     nals.removeAll(keepingCapacity: true)
     pieces.removeAll(keepingCapacity: true)
     pendingBytes = 0
+    lastVCLIndex = nil
   }
 
-  /// Append a NAL-body piece, enforcing the per-access-unit size cap so a
-  /// never-terminating FU or a flood of NALs at one timestamp can't exhaust
-  /// memory.
-  private mutating func appendPiece(_ piece: Data) -> Result<Void, DepacketizeError> {
-    guard pendingBytes + piece.count <= Self.maxAccessUnitBytes else {
+  /// Charge `bytes` of output and one buffered entry against the per-access-unit
+  /// caps, failing when either would be exceeded, so a never-terminating FU or
+  /// a flood of NALs at one timestamp can't exhaust memory.
+  private mutating func reserve(_ bytes: Int) -> Result<Void, DepacketizeError> {
+    guard pendingBytes + bytes <= Self.maxAccessUnitBytes else {
       return .failure(
         DepacketizeError("H.265 access unit exceeded \(Self.maxAccessUnitBytes) bytes"))
     }
-    pieces.append(piece)
-    pendingBytes += piece.count
+    guard nals.count + pieces.count < Self.maxAccessUnitEntries else {
+      return .failure(
+        DepacketizeError(
+          "H.265 access unit exceeded \(Self.maxAccessUnitEntries) NAL units and fragments"))
+    }
+    pendingBytes += bytes
     return .success(())
+  }
+
+  /// Append a NAL-body piece, charging it against the access-unit caps. An
+  /// empty piece is skipped: it adds no output but would still use memory.
+  private mutating func appendPiece(_ piece: Data) -> Result<Void, DepacketizeError> {
+    guard !piece.isEmpty else { return .success(()) }
+    if case .failure(let e) = reserve(piece.count) { return .failure(e) }
+    pieces.append(piece)
+    return .success(())
+  }
+
+  /// Append a NAL entry, charging its 4-byte length prefix and 2-byte header
+  /// against the access-unit caps (its body is charged as pieces).
+  private mutating func appendNAL(_ nal: NALEntry) -> Result<Void, DepacketizeError> {
+    if case .failure(let e) = reserve(4 + 2) { return .failure(e) }
+    nals.append(nal)
+    if case .vcl = nal.hdr.unitType.unitTypeClass {
+      lastVCLIndex = nals.count - 1
+    }
+    return .success(())
+  }
+
+  /// Remove the NAL units after `lastVCL` that belong to the next access unit
+  /// (from the first one that `startsAccessUnit` on) from the access unit in
+  /// progress, with their pieces and their share of `pendingBytes`. Only
+  /// called with no FU in progress, so every NAL's `nextPieceIdx` is final.
+  private mutating func takeNextAccessUnitNALs(after lastVCL: Int) -> MovedNALs {
+    let tail = nals[(lastVCL + 1)...]
+    guard let first = tail.firstIndex(where: { Self.startsAccessUnit($0.hdr.unitType) }) else {
+      return MovedNALs(nals: [], pieces: [], bytes: 0)
+    }
+    // `first` > `lastVCL` >= 0, so a NAL precedes it.
+    let pieceStart = nals[first - 1].nextPieceIdx
+    var moved = MovedNALs(nals: [], pieces: Array(pieces[pieceStart...]), bytes: 0)
+    for nal in nals[first...] {
+      moved.nals.append(
+        NALEntry(hdr: nal.hdr, nextPieceIdx: nal.nextPieceIdx - pieceStart, len: nal.len))
+      // Each NAL was charged its 4-byte length prefix plus `len` (2-byte
+      // header and body).
+      moved.bytes += 4 + nal.len
+    }
+    nals.removeSubrange(first...)
+    pieces.removeSubrange(pieceStart...)
+    pendingBytes -= moved.bytes
+    return moved
+  }
+
+  /// Start the (empty) access unit in progress with `moved`. None of them is a
+  /// VCL NAL unit.
+  private mutating func restore(_ moved: MovedNALs) {
+    nals.append(contentsOf: moved.nals)
+    pieces.append(contentsOf: moved.pieces)
+    pendingBytes += moved.bytes
+  }
+
+  /// The loss to report on the next frame after dropping `au`: its own loss
+  /// plus one for the dropped data.
+  private static func lossAfterDropping(_ au: AccessUnit) -> UInt16 {
+    UInt16(clamping: UInt32(au.loss) + 1)
+  }
+
+  /// After a failed push, drop the rest of the access unit `pkt` belongs to:
+  /// later packets with its timestamp are ignored (or, if `pkt` had the MARK
+  /// bit, the next packet starts a new access unit), and the next frame's
+  /// `loss` reports the drop. Without this, the remaining packets would start
+  /// a fresh access unit and deliver a partial picture with `loss` 0.
+  private mutating func discardAccessUnit(after pkt: ReceivedRTPPacket, _ au: AccessUnit) {
+    resetAccumulation()
+    let loss = Self.lossAfterDropping(au)
+    if pkt.mark {
+      inputState = .postMark(timestamp: pkt.timestamp, loss: loss)
+    } else {
+      inputState = .loss(timestamp: pkt.timestamp, pkts: loss)
+    }
+  }
+
+  /// Finalize `au` into `pending`. Returns the loss to carry into the next
+  /// access unit: 0, or if finalization failed (the frame is dropped) the
+  /// dropped unit's loss plus one.
+  private mutating func emitAccessUnit(_ au: inout AccessUnit) -> UInt16 {
+    let frame = finalizeAccessUnit(&au)
+    pending.append(frame)
+    if case .failure = frame {
+      return Self.lossAfterDropping(au)
+    }
+    return 0
   }
 
   /// Returns the next completed item, or nil when none are buffered.
@@ -151,6 +274,16 @@ struct H265Depacketizer: Sendable {
   private mutating func pushInner(
     _ pkt: ReceivedRTPPacket
   ) -> Result<Void, DepacketizeError> {
+    // A payload shorter than the 2-byte NAL header has no NAL. Without loss it
+    // changes nothing, so return before the state machine below can finalize
+    // or clear the access unit in progress. With loss, run the state machine
+    // so the loss is recorded.
+    let payload = pkt.payload
+    let isShort = payload.count < 2
+    if isShort && pkt.loss == 0 {
+      return .success(())
+    }
+
     var accessUnit: AccessUnit
 
     switch inputState {
@@ -162,30 +295,40 @@ struct H265Depacketizer: Sendable {
       let loss = pkt.loss
       if loss > 0 {
         resetAccumulation()
+        // The discarded unit's own loss (carried from before it) still has
+        // to reach the next frame.
+        let carried = UInt16(clamping: UInt32(au.loss) + UInt32(loss))
         if sameTimestamp(pkt.timestamp, au.timestamp) {
           if pkt.mark {
-            inputState = .postMark(timestamp: au.timestamp, loss: loss)
+            inputState = .postMark(timestamp: au.timestamp, loss: carried)
           } else {
-            inputState = .loss(timestamp: au.timestamp, pkts: loss)
+            inputState = .loss(timestamp: au.timestamp, pkts: carried)
           }
           return .success(())
         }
-        accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
+        accessUnit = AccessUnit.start(pkt, additionalLoss: au.loss, sameTsAsPrev: false)
       } else if !sameTimestamp(pkt.timestamp, au.timestamp) {
         if au.inFU {
           let desc =
             "timestamp changed from \(au.timestamp) to \(pkt.timestamp) in the middle of a fragmented NAL"
           pending.append(.failure(DepacketizeError(desc)))
           resetAccumulation()
-          accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
-        } else if nals.isEmpty {
-          return .failure(DepacketizeError("nals should not be empty"))
-        } else if canEndAU(nals.last!.hdr.unitType) {
-          let frame = finalizeAccessUnit(&au)
-          pending.append(frame)
+          accessUnit = AccessUnit.start(
+            pkt, additionalLoss: Self.lossAfterDropping(au), sameTsAsPrev: false)
+        } else if let lastVCL = lastVCLIndex {
+          // AU boundary. After the last VCL NAL, an AUD, VPS, SPS, PPS or
+          // prefix SEI starts the next access unit (H.265 section 7.4.2.4.4):
+          // move the NALs from the first of those on to the new one, so
+          // their parameter sets apply there.
+          let moved = takeNextAccessUnitNALs(after: lastVCL)
+          let carriedLoss = emitAccessUnit(&au)
           resetAccumulation()
-          accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
+          accessUnit = AccessUnit.start(pkt, additionalLoss: carriedLoss, sameTsAsPrev: false)
+          restore(moved)
         } else {
+          // No VCL NAL yet, so no picture to end: only non-VCL NALs (sent with
+          // the previous picture's timestamp) or none (a short packet with
+          // loss started this access unit). Adopt the new timestamp.
           au.timestamp = pkt.timestamp
           accessUnit = au
         }
@@ -207,11 +350,61 @@ struct H265Depacketizer: Sendable {
       accessUnit = AccessUnit.start(pkt, additionalLoss: lossPkts, sameTsAsPrev: false)
     }
 
-    // Parse 2-byte NAL header from payload
-    let payload = pkt.payload
-    guard payload.count >= 2 else {
+    // A short payload with loss: the state machine has recorded the loss; the
+    // packet adds no NAL.
+    if isShort {
+      inputState = .preMark(accessUnit)
       return .success(())
     }
+
+    switch addPayload(pkt, to: &accessUnit) {
+    case .failure(let err):
+      discardAccessUnit(after: pkt, accessUnit)
+      return .failure(err)
+    case .success(false):
+      // FU continuation whose start was lost: drop the rest of the AU.
+      resetAccumulation()
+      // `accessUnit.loss` already includes this packet's gap.
+      inputState = .loss(timestamp: accessUnit.timestamp, pkts: accessUnit.loss)
+      return .success(())
+    case .success(true):
+      break
+    }
+
+    // Post-processing: handle mark bit
+    if pkt.mark {
+      guard !nals.isEmpty else {
+        discardAccessUnit(after: pkt, accessUnit)
+        return .failure(DepacketizeError("nals should not be empty after mark"))
+      }
+      if lastVCLIndex != nil {
+        // The access unit has a picture: MARK ends it, with any non-VCL NALs
+        // the camera sent after the picture with this MARK.
+        accessUnit.endCtx = pkt.ctx
+        let carriedLoss = emitAccessUnit(&accessUnit)
+        inputState = .postMark(timestamp: pkt.timestamp, loss: carriedLoss)
+      } else {
+        // MARK on non-VCL NALs before any picture: not an access unit yet.
+        accessUnit.timestamp = pkt.timestamp
+        inputState = .preMark(accessUnit)
+      }
+    } else {
+      inputState = .preMark(accessUnit)
+    }
+
+    return .success(())
+  }
+
+  /// Add the NAL units in a payload of at least 2 bytes to the access unit in
+  /// progress.
+  ///
+  /// Returns `false` when `pkt` is a FU continuation whose start was lost
+  /// (`pkt.loss > 0`); the caller then drops the rest of the access unit.
+  private mutating func addPayload(
+    _ pkt: ReceivedRTPPacket, to accessUnit: inout AccessUnit
+  ) -> Result<Bool, DepacketizeError> {
+    // Parse 2-byte NAL header from payload
+    let payload = pkt.payload
     let hdr: H265NALHeader
     do {
       hdr = try H265NALHeader(
@@ -232,10 +425,9 @@ struct H265Depacketizer: Sendable {
       }
       let body = Data(payload[(payload.startIndex + 2)...])
       let len = body.count + 2  // includes 2-byte header
-      if !body.isEmpty {
-        if case .failure(let e) = appendPiece(body) { return .failure(e) }
-      }
-      nals.append(NALEntry(hdr: hdr, nextPieceIdx: pieces.count, len: len))
+      if case .failure(let e) = appendPiece(body) { return .failure(e) }
+      let nal = NALEntry(hdr: hdr, nextPieceIdx: pieces.count, len: len)
+      if case .failure(let e) = appendNAL(nal) { return .failure(e) }
 
     case 48:
       // Aggregation Packet (RFC 7798 section 4.4.2)
@@ -281,13 +473,9 @@ struct H265Depacketizer: Sendable {
           nalData.count > 2
           ? Data(nalData[(nalData.startIndex + 2)...])
           : Data()
-        if !innerBody.isEmpty {
-          if case .failure(let e) = appendPiece(innerBody) { return .failure(e) }
-        }
-        nals.append(
-          NALEntry(
-            hdr: innerHdr, nextPieceIdx: pieces.count,
-            len: nalLen))
+        if case .failure(let e) = appendPiece(innerBody) { return .failure(e) }
+        let nal = NALEntry(hdr: innerHdr, nextPieceIdx: pieces.count, len: nalLen)
+        if case .failure(let e) = appendNAL(nal) { return .failure(e) }
 
         offset += nalLen
       }
@@ -328,11 +516,11 @@ struct H265Depacketizer: Sendable {
           seenSingleFragmentFu = true
         }
         if case .failure(let e) = appendPiece(fuPayload) { return .failure(e) }
-        nals.append(
-          NALEntry(
-            hdr: reconstructedHdr,
-            nextPieceIdx: Int.max,  // overwritten on end (which may be now)
-            len: 2 + fuPayload.count))
+        let nal = NALEntry(
+          hdr: reconstructedHdr,
+          nextPieceIdx: Int.max,  // overwritten on end (which may be now)
+          len: 2 + fuPayload.count)
+        if case .failure(let e) = appendNAL(nal) { return .failure(e) }
         piecesLen = pieces.count
       case (false, true):
         if case .failure(let e) = appendPiece(fuPayload) { return .failure(e) }
@@ -347,9 +535,7 @@ struct H265Depacketizer: Sendable {
         nals[nals.count - 1] = nal
       case (false, false):
         if pkt.loss > 0 {
-          resetAccumulation()
-          inputState = .loss(timestamp: accessUnit.timestamp, pkts: pkt.loss)
-          return .success(())
+          return .success(false)
         }
         return .failure(
           DepacketizeError("FU has start bit unset while no frag in progress"))
@@ -367,39 +553,28 @@ struct H265Depacketizer: Sendable {
       return .failure(DepacketizeError("unexpected/bad nal header type \(nalTypeRaw)"))
     }
 
-    // Post-processing: handle mark bit
-    if pkt.mark {
-      guard !nals.isEmpty else {
-        return .failure(DepacketizeError("nals should not be empty after mark"))
-      }
-      if canEndAU(nals.last!.hdr.unitType) {
-        accessUnit.endCtx = pkt.ctx
-        let frame = finalizeAccessUnit(&accessUnit)
-        pending.append(frame)
-        inputState = .postMark(timestamp: pkt.timestamp, loss: 0)
-      } else {
-        accessUnit.timestamp = pkt.timestamp
-        inputState = .preMark(accessUnit)
-      }
-    } else {
-      inputState = .preMark(accessUnit)
-    }
-
-    return .success(())
+    return .success(true)
   }
 
   // MARK: - Access Unit Finalization
 
-  /// Returns true if we allow the given NAL unit type to end an access unit.
-  private func canEndAU(_ unitType: H265UnitType) -> Bool {
+  /// Whether a NAL unit of this type after the last VCL NAL unit of an access
+  /// unit starts the next access unit (H.265 section 7.4.2.4.4): access unit
+  /// delimiter, VPS, SPS, PPS, prefix SEI, and types 41–44 and 48–55. Others,
+  /// such as a suffix SEI or end of sequence, belong to the access unit they
+  /// follow.
+  ///
+  /// An access unit ends (on MARK or a timestamp change) only once it has a
+  /// VCL NAL unit (types 0–31); one of only non-VCL NAL units is not a picture.
+  private static func startsAccessUnit(_ unitType: H265UnitType) -> Bool {
     switch unitType {
-    case .vpsNut, .spsNut, .ppsNut,
+    case .vpsNut, .spsNut, .ppsNut, .audNut, .prefixSeiNut,
       .rsvNvcl41, .rsvNvcl42, .rsvNvcl43, .rsvNvcl44,
       .unspec48, .unspec49, .unspec50, .unspec51,
       .unspec52, .unspec53, .unspec54, .unspec55:
-      return false
-    default:
       return true
+    default:
+      return false
     }
   }
 
@@ -410,9 +585,9 @@ struct H265Depacketizer: Sendable {
     var totalLen = 0
     var isRandomAccessPoint = false
     let isDisposable = false
-    var newVPS: Data?
-    var newSPS: Data?
-    var newPPS: Data?
+    var vpsCandidates = ParameterSetCandidates(stored: parameters?.vpsNAL)
+    var spsCandidates = ParameterSetCandidates(stored: parameters?.spsNAL)
+    var ppsCandidates = ParameterSetCandidates(stored: parameters?.ppsNAL)
 
     // First pass: check parameters, RAP status, calculate total length
     for nal in nals {
@@ -421,21 +596,13 @@ struct H265Depacketizer: Sendable {
 
       switch nal.hdr.unitType {
       case .vpsNut:
-        let assembled = reassembleNAL(nal, pieces: nalPieces)
-        if parameters == nil || assembled != parameters!.vpsNAL {
-          newVPS = assembled
-        }
+        vpsCandidates.add(reassembleNAL(nal, pieces: nalPieces))
       case .spsNut:
-        let assembled = reassembleNAL(nal, pieces: nalPieces)
-        if parameters == nil || assembled != parameters!.spsNAL {
-          newSPS = assembled
-        }
+        spsCandidates.add(reassembleNAL(nal, pieces: nalPieces))
       case .ppsNut:
-        let assembled = reassembleNAL(nal, pieces: nalPieces)
-        if parameters == nil || assembled != parameters!.ppsNAL {
-          newPPS = assembled
-        }
+        ppsCandidates.add(reassembleNAL(nal, pieces: nalPieces))
       default:
+        // IRAP pictures (BLA, IDR, CRA, reserved IRAP: types 16...23).
         if case .vcl(intraCoded: true) = nal.hdr.unitType.unitTypeClass {
           isRandomAccessPoint = true
         }
@@ -468,6 +635,9 @@ struct H265Depacketizer: Sendable {
     resetAccumulation()
 
     // Update parameters if changed
+    let newVPS = vpsCandidates.replacement
+    let newSPS = spsCandidates.replacement
+    let newPPS = ppsCandidates.replacement
     let allNew = newVPS != nil && newSPS != nil && newPPS != nil
     let someNew = newVPS != nil || newSPS != nil || newPPS != nil
     let hasNewParameters: Bool
@@ -497,7 +667,10 @@ struct H265Depacketizer: Sendable {
         streamId: au.streamId,
         isRandomAccessPoint: isRandomAccessPoint,
         isDisposable: isDisposable,
-        data: data))
+        data: data,
+        parameterSets: parameters.map {
+          VideoParameterSetNALs(sps: $0.spsNAL, pps: $0.ppsNAL, vps: $0.vpsNAL)
+        }))
   }
 
   /// Reassemble a NAL from its 2-byte header and pieces.

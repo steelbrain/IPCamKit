@@ -138,6 +138,10 @@ struct ReceivedRTPPacket: Sendable, Equatable {
   var timestamp: Timestamp
   var raw: RawRTPPacket
   var loss: UInt16
+  /// The packet starts a new mapping of RTP timestamps onto the timeline (a
+  /// new source, a seek, or a sender whose RTP clock restarted), so its
+  /// timestamp isn't comparable with the previous packet's RTP timestamp.
+  var timelineRebased = false
 
   var mark: Bool { raw.mark }
   var sequenceNumber: UInt16 { raw.sequenceNumber }

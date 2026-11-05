@@ -15,37 +15,16 @@ struct H265Parameters: Sendable, Equatable {
   /// Parse format-specific parameters from SDP fmtp attribute.
   ///
   /// Expected keys: `sprop-vps`, `sprop-sps`, `sprop-pps`, optionally `tx-mode=SRST`.
+  /// Also runs `validateTransmissionMode`.
   static func parseFormatSpecificParams(_ fmtp: String) throws -> H265Parameters {
+    try validateTransmissionMode(fmtp)
+
     var spsNAL: Data?
     var ppsNAL: Data?
     var vpsNAL: Data?
 
-    for p in fmtp.split(separator: ";") {
-      let trimmed = p.trimmingCharacters(in: .whitespaces)
-      if trimmed.isEmpty { continue }  // tolerate a trailing ';'
-      // Skip flag-style tokens lacking '=' rather than rejecting the whole fmtp
-      // (matches the H264 parser; a real camera's stray token must not drop the
-      // parameter sets).
-      guard let eqIdx = trimmed.firstIndex(of: "=") else { continue }
-      // Match keys case-insensitively (cameras emit Sprop-VPS, tx-mode=srst).
-      // The value keeps its case — base64 NALs are case-significant.
-      let key = trimmed[..<eqIdx].trimmingCharacters(in: .whitespaces).lowercased()
-      let value = trimmed[trimmed.index(after: eqIdx)...].trimmingCharacters(in: .whitespaces)
-
+    for (key, value) in fmtpPairs(fmtp) {
       switch key {
-      case "tx-mode":
-        guard value.uppercased() == "SRST" else {
-          throw RTSPError.depacketizationError(
-            "unsupported/unexpected tx-mode \(value); expected SRST")
-        }
-      case "sprop-max-don-diff":
-        // DONL/DOND decoding is not implemented (SRST without DON only). A camera
-        // advertising >0 prepends a DONL to every FU/AP, which we'd misread as
-        // NAL data — fail loud rather than silently emit corrupt frames.
-        if let n = Int(value), n > 0 {
-          throw RTSPError.depacketizationError(
-            "unsupported sprop-max-don-diff=\(n); DONL/DOND decoding not implemented")
-        }
       case "sprop-vps":
         try storeSpropNAL(key: "sprop-vps", value: value, out: &vpsNAL)
       case "sprop-sps":
@@ -70,6 +49,48 @@ struct H265Parameters: Sendable, Equatable {
     return try parseVPSSPSPPS(vps: vps, sps: sps, pps: pps)
   }
 
+  /// Throw if the fmtp describes a stream the depacketizer can't handle: a
+  /// `tx-mode` other than SRST, or `sprop-max-don-diff` > 0. DONL/DOND decoding
+  /// is not implemented (SRST without DON only); with a nonzero value the
+  /// camera adds DONL fields to its packets, which would be misread as NAL
+  /// data. Kept apart from parsing the parameter sets so a caller that falls
+  /// back to in-band parameters on a bad sprop-* value still fails loud here
+  /// rather than silently emitting corrupt frames.
+  static func validateTransmissionMode(_ fmtp: String) throws {
+    for (key, value) in fmtpPairs(fmtp) {
+      switch key {
+      case "tx-mode":
+        guard value.uppercased() == "SRST" else {
+          throw RTSPError.depacketizationError(
+            "unsupported/unexpected tx-mode \(cutForMessage(value)); expected SRST")
+        }
+      case "sprop-max-don-diff":
+        if let n = Int(value), n > 0 {
+          throw RTSPError.depacketizationError(
+            "unsupported sprop-max-don-diff=\(n); DONL/DOND decoding not implemented")
+        }
+      default:
+        break
+      }
+    }
+  }
+
+  /// The `key=value` pairs of an fmtp string, with keys lowercased (cameras
+  /// emit Sprop-VPS, tx-mode=srst). Values keep their case: base64 NALs are
+  /// case-significant. Empty tokens (a trailing ';') and flag-style tokens
+  /// lacking '=' are skipped rather than rejecting the whole fmtp (matches the
+  /// H264 parser; a real camera's stray token must not drop the parameter sets).
+  /// Produced one at a time, as the fmtp can be as large as the SDP.
+  private static func fmtpPairs(_ fmtp: String) -> some Sequence<(key: String, value: String)> {
+    fmtp.lazySplit(separator: ";").lazy.compactMap { p -> (key: String, value: String)? in
+      let trimmed = p.trimmingCharacters(in: .whitespaces)
+      guard let eqIdx = trimmed.firstIndex(of: "=") else { return nil }
+      let key = trimmed[..<eqIdx].trimmingCharacters(in: .whitespaces).lowercased()
+      let value = trimmed[trimmed.index(after: eqIdx)...].trimmingCharacters(in: .whitespaces)
+      return (key: key, value: value)
+    }
+  }
+
   private static func storeSpropNAL(
     key: String, value: String, out: inout Data?
   ) throws {
@@ -79,10 +100,10 @@ struct H265Parameters: Sendable, Equatable {
     // RFC 7798 7.1: the value is a comma-separated list of base64 NAL units.
     // Take the first valid NAL — the struct holds a single VPS/SPS/PPS, and the
     // RFC requires later entries be consistent with the first.
-    for element in value.split(separator: ",") {
+    for element in value.lazySplit(separator: ",") {
       let b64 = element.trimmingCharacters(in: .whitespaces)
       guard !b64.isEmpty else { continue }
-      guard let decoded = Data(base64Encoded: b64) else {
+      guard let decoded = decodeSpropBase64(b64) else {
         throw RTSPError.depacketizationError(
           "bad parameter \(key): NAL has invalid base64 encoding")
       }
@@ -117,6 +138,16 @@ struct H265Parameters: Sendable, Equatable {
   static func parseVPSSPSPPS(
     vps vpsNAL: Data, sps spsNAL: Data, pps ppsNAL: Data
   ) throws -> H265Parameters {
+    // The HEVCDecoderConfigurationRecord stores each NAL length in a u16, so a
+    // parameter NAL over 65535 bytes would trap building it. Reject it before
+    // any splitting or RBSP decoding, mirroring the H264 path: the depacketizer
+    // offers an oversized set again with every frame that carries it. (No real
+    // camera emits a >64 KiB parameter set.)
+    guard vpsNAL.count <= 0xFFFF, spsNAL.count <= 0xFFFF, ppsNAL.count <= 0xFFFF else {
+      throw RTSPError.depacketizationError(
+        "VPS/SPS/PPS NAL exceeds 65535 bytes; cannot fit the HEVC record u16 length")
+    }
+
     // Validate VPS
     let (vpsH, _) = try h265SplitNAL(vpsNAL)
     guard vpsH.unitType == .vpsNut else {
@@ -139,14 +170,6 @@ struct H265Parameters: Sendable, Equatable {
     let ppsRBSP = decodeRBSP(ppsBody)
     let pps = try parseH265PPS(ppsRBSP)
 
-    // The HEVCDecoderConfigurationRecord stores each NAL length in a u16, so a
-    // parameter NAL over 65535 bytes would trap building it. Reject up front,
-    // mirroring the H264 path. (No real camera emits a >64 KiB parameter set.)
-    guard vpsNAL.count <= 0xFFFF, spsNAL.count <= 0xFFFF, ppsNAL.count <= 0xFFFF else {
-      throw RTSPError.depacketizationError(
-        "VPS/SPS/PPS NAL exceeds 65535 bytes; cannot fit the HEVC record u16 length")
-    }
-
     let rfc6381Codec = sps.rfc6381Codec()
     let dims = try sps.pixelDimensions()
     guard let width = UInt16(exactly: dims.0), let height = UInt16(exactly: dims.1) else {
@@ -158,7 +181,9 @@ struct H265Parameters: Sendable, Equatable {
     var frameRate: (num: UInt32, den: UInt32)?
     if let vui = sps.vui {
       pixelAspectRatio = vui.aspectRatio
-      if let timing = vui.timingInfo {
+      // Both must be > 0 (H.265 E.3.1); drop a zero rather than report a
+      // meaningless or divide-by-zero rate, as the H.264 path does.
+      if let timing = vui.timingInfo, timing.numUnitsInTick > 0, timing.timeScale > 0 {
         frameRate = (num: timing.numUnitsInTick, den: timing.timeScale)
       }
     }

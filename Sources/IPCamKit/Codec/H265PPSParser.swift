@@ -12,6 +12,11 @@ struct H265Pps: Sendable {
 }
 
 /// Parse an H.265 PPS from RBSP bits (after NAL header has been stripped and RBSP decoded).
+///
+/// Reads only through `entropy_coding_sync_enabled_flag`, the last field kept.
+/// The rest (tile layout, deblocking, scaling lists, extensions) is not
+/// interpreted, so a PPS using syntax this parser doesn't implement, such as
+/// `pps_range_extension`, is still accepted.
 func parseH265PPS(_ rbsp: Data) throws -> H265Pps {
   var reader = BitReader(rbsp)
 
@@ -43,69 +48,6 @@ func parseH265PPS(_ rbsp: Data) throws -> H265Pps {
   else {
     throw RTSPError.depacketizationError("PPS: can't read tiles/entropy flags")
   }
-
-  if tilesEnabled {
-    guard let numTileColumns = reader.readExpGolomb(),
-      let numTileRows = reader.readExpGolomb()
-    else {
-      throw RTSPError.depacketizationError("PPS: can't read tile dimensions")
-    }
-    guard let uniformSpacing = reader.readBool() else {
-      throw RTSPError.depacketizationError("PPS: can't read uniform_spacing_flag")
-    }
-    if !uniformSpacing {
-      // numTileColumns/Rows are attacker-controlled exp-Golomb values; stop as
-      // soon as the bitstream runs out so a bogus count can't spin.
-      for _ in 0..<numTileColumns {
-        guard reader.readExpGolomb() != nil else { break }  // column_width_minus1
-      }
-      for _ in 0..<numTileRows {
-        guard reader.readExpGolomb() != nil else { break }  // row_height_minus1
-      }
-    }
-    _ = reader.readBool()  // loop_filter_across_tiles_enabled_flag
-  }
-
-  _ = reader.readBool()  // pps_loop_filter_across_slices_enabled_flag
-  if let deblockPresent = reader.readBool(), deblockPresent {
-    _ = reader.readBool()  // deblocking_filter_override_enabled_flag
-    if let disabled = reader.readBool(), !disabled {
-      _ = reader.readSignedExpGolomb()  // pps_beta_offset_div2
-      _ = reader.readSignedExpGolomb()  // pps_tc_offset_div2
-    }
-  }
-
-  if let scalingListPresent = reader.readBool(), scalingListPresent {
-    try skipH265ScalingListData(&reader)
-  }
-  _ = reader.readBool()  // lists_modification_present_flag
-  _ = reader.readExpGolomb()  // log2_parallel_merge_level_minus2
-  _ = reader.readBool()  // slice_segment_header_extension_present_flag
-
-  if let extensionPresent = reader.readBool(), extensionPresent {
-    let rangeExt = reader.readBool() ?? false
-    let multilayerExt = reader.readBool() ?? false
-    let ext3d = reader.readBool() ?? false
-    let sccExt = reader.readBool() ?? false
-    let ext4bits = reader.readBits(4) ?? 0
-    if rangeExt {
-      throw RTSPError.depacketizationError("pps_range_extension_flag unimplemented")
-    }
-    if multilayerExt {
-      throw RTSPError.depacketizationError("pps_multilayer_extension_flag unimplemented")
-    }
-    if ext3d {
-      throw RTSPError.depacketizationError("pps_3d_extension_flag unimplemented")
-    }
-    if sccExt {
-      throw RTSPError.depacketizationError("pps_scc_extension_flag unimplemented")
-    }
-    if ext4bits != 0 {
-      throw RTSPError.depacketizationError("pps_extension_4bits unimplemented")
-    }
-  }
-
-  // finish_rbsp — tolerant
 
   return H265Pps(
     tilesEnabledFlag: tilesEnabled,

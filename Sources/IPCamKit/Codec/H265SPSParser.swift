@@ -596,6 +596,13 @@ struct H265Sps: Sendable {
   func pixelDimensions() throws -> (UInt32, UInt32) {
     var width = picWidthInLumaSamples
     var height = picHeightInLumaSamples
+    // pic_width_in_luma_samples and pic_height_in_luma_samples must not be 0
+    // (H.265 §7.4.3.2.1). The H.264 SPS parser likewise rejects a non-positive
+    // width or height.
+    guard width > 0, height > 0 else {
+      throw RTSPError.depacketizationError(
+        "SPS has invalid pixel dimensions: \(width)x\(height)")
+    }
     if let c = conformanceWindow {
       // Compute the crop in 64-bit so malformed offsets can't wrap a 32-bit add
       // to a small/zero value and silently yield wrong dimensions. The crop must
@@ -840,9 +847,9 @@ func parseH265SPS(_ rbsp: Data) throws -> H265Sps {
         }
       }
     }
-    if ext4bits != 0 {
-      throw RTSPError.depacketizationError("sps_extension_4bits unimplemented")
-    }
+    // sps_extension_4bits announces extensions defined after these; nothing
+    // in or after them is used, so parsing ends here either way.
+    _ = ext4bits
   }
 
   // finish_rbsp — tolerant, don't error on extra trailing data

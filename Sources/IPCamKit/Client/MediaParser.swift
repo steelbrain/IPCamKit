@@ -49,32 +49,42 @@ func parseMedia(
   mediaDescription: SDPMediaDescription
 ) throws -> Stream {
   let media = mediaDescription.media
+  // For messages: the media type as the server wrote it, cut short.
+  let shownMedia = cutForMessage(media)
 
   // Validate protocol contains "RTP/"
   let proto = mediaDescription.proto.uppercased()
   guard proto.contains("RTP/") || proto.contains("MP2T/") else {
     throw RTSPError.invalidSDP(
-      "Unsupported protocol \(mediaDescription.proto) for \(media)")
+      "Unsupported protocol \(cutForMessage(mediaDescription.proto)) for \(shownMedia)")
   }
 
   // Get first payload type from fmt field (tolerate tab/space separators).
-  let fmtParts = mediaDescription.fmt.split(whereSeparator: { $0 == " " || $0 == "\t" })
-  guard let firstFmt = fmtParts.first else {
+  // Only the first is used; the list itself isn't split (it can be 2 MiB).
+  let firstFmt = mediaDescription.fmt.drop(while: { $0 == " " || $0 == "\t" })
+    .prefix(while: { $0 != " " && $0 != "\t" })
+  guard !firstFmt.isEmpty else {
     throw RTSPError.invalidSDP("Empty fmt in media line")
   }
   guard let payloadType = UInt8(firstFmt.trimmingCharacters(in: .whitespaces)),
     payloadType & 0x80 == 0
   else {
-    throw RTSPError.invalidSDP("Invalid payload type: \(firstFmt)")
+    throw RTSPError.invalidSDP("Invalid payload type: \(cutForMessage(firstFmt))")
   }
 
   // Extract attributes
   var rtpmap: String?
   var fmtp: String?
-  var controlURL: String?
+  var controlValue: String?
   var framerate: Float?
+  var direction: MediaDirection?
+  var keyMgmt: String?
 
   for attr in mediaDescription.attributes {
+    if let parsed = MediaDirection(rawValue: attr.name) {
+      direction = parsed
+      continue
+    }
     switch attr.name {
     case "rtpmap":
       if let value = attr.value {
@@ -99,13 +109,26 @@ func parseMedia(
         }
       }
     case "control":
-      if let value = attr.value {
-        controlURL = joinControl(base: baseURL, control: value)
+      if let value = attr.value?.trimmingCharacters(in: .whitespaces) {
+        // The control URL goes on SETUP's request line; a space or control
+        // character there would split or inject into the request.
+        guard !hasUnsafeURLCharacters(value) else {
+          throw RTSPError.invalidSDP(
+            "Invalid control URL \(quotedForMessage(value)) for \(shownMedia)")
+        }
+        guard value.utf8.count <= maxControlURLBytes else {
+          throw RTSPError.invalidSDP(
+            "Control URL for \(shownMedia) is longer than \(maxControlURLBytes) bytes")
+        }
+        // The last a=control wins; it is joined to the base once, below.
+        controlValue = value
       }
     case "framerate":
       if let value = attr.value {
         framerate = Float(value.trimmingCharacters(in: .whitespaces))
       }
+    case "key-mgmt":
+      keyMgmt = attr.value?.trimmingCharacters(in: .whitespaces)
     default:
       break
     }
@@ -118,13 +141,14 @@ func parseMedia(
 
   if let rtpmap = rtpmap {
     // Parse rtpmap: "encoding/clockRate[/channels]"
-    let parts = rtpmap.split(separator: "/")
+    // encoding/clockRate[/channels]: nothing after a 3rd part is read.
+    let parts = Array(rtpmap.lazySplit(separator: "/").prefix(3))
     guard parts.count >= 2 else {
-      throw RTSPError.invalidSDP("Invalid rtpmap: \(rtpmap)")
+      throw RTSPError.invalidSDP("Invalid rtpmap: \(cutForMessage(rtpmap))")
     }
     encodingName = String(parts[0]).lowercased()
     guard let rate = UInt32(parts[1].trimmingCharacters(in: .whitespaces)) else {
-      throw RTSPError.invalidSDP("Invalid clock rate in rtpmap: \(rtpmap)")
+      throw RTSPError.invalidSDP("Invalid clock rate in rtpmap: \(cutForMessage(rtpmap))")
     }
     clockRate = rate
     if parts.count >= 3 {
@@ -140,39 +164,94 @@ func parseMedia(
       "No rtpmap for dynamic payload type \(payloadType)")
   }
 
-  return Stream(
+  var stream = Stream(
     media: media,
     encodingName: encodingName,
     rtpPayloadType: payloadType,
     clockRateHz: clockRate,
     channels: channels,
     framerate: framerate,
-    control: controlURL,
-    formatSpecificParams: fmtp
+    control: controlValue.map { joinControl(base: baseURL, control: $0) },
+    formatSpecificParams: fmtp,
+    direction: direction
   )
+  stream.keyMgmt = keyMgmt
+  return stream
 }
 
 /// Join a control URL to a base URL.
 ///
-/// Join a control URL to a base URL.
-///
 /// Matches upstream `join_control()` from parse.rs lines 190-209.
-/// Uses URL parsing to detect absolute URLs (not just rtsp:// scheme).
+/// - The control value is trimmed of surrounding blanks.
 /// - `"*"` returns base_url
-/// - Absolute URLs (any scheme detected by URL parser) are returned as-is
-/// - Relative URLs are appended to base_url with proper "/" handling
-func joinControl(base: String, control: String) -> String {
+/// - Absolute URLs (any scheme, see `hasURIScheme`) are returned as-is
+/// - An absolute path (`/other/track1`) replaces the base URL's path, and a
+///   network-path reference (`//host/path`) keeps only its scheme (RFC 3986 5.2)
+/// - Other relative URLs are appended to base_url with proper "/" handling.
+///   RTSP treats the base as a directory, and plain appending keeps Dahua's
+///   query-string bases (`.../realmonitor?channel=1&subtype=0/` + `trackID=0`)
+///   working, which RFC 3986 merging would not.
+func joinControl(base: String, control rawControl: String) -> String {
+  let control = rawControl.trimmingCharacters(in: .whitespaces)
   if control == "*" {
     return base
   }
-  // Use URLComponents to detect absolute URLs (matches Url::parse behavior)
-  if let parsed = URLComponents(string: control), parsed.scheme != nil {
+  if hasURIScheme(control) {
     return control
+  }
+  if control.hasPrefix("/"), hasURIScheme(base), let colon = base.firstIndex(of: ":"),
+    base[colon...].hasPrefix("://")
+  {
+    if control.hasPrefix("//") {
+      return base[..<colon] + ":" + control
+    }
+    // Scanned as bytes: a base can be 8 KB, and Character iteration is slow.
+    let authority = base.utf8[base.utf8.index(colon, offsetBy: 3)...]
+    let authorityEnd =
+      authority.firstIndex(where: {
+        $0 == UInt8(ascii: "/") || $0 == UInt8(ascii: "?") || $0 == UInt8(ascii: "#")
+      })
+      ?? base.endIndex
+    return String(base[..<authorityEnd]) + control
   }
   // Join relative URL
   var baseStr = base
   if !baseStr.hasSuffix("/") {
     baseStr += "/"
   }
-  return baseStr + control
+  return baseStr + (control.hasPrefix("/") ? control.dropFirst() : control[...])
+}
+
+/// Whether a server-supplied URL (a `Content-Base` or an `a=control` value)
+/// holds a space, control character or DEL, any of which would split or inject
+/// into the request line it ends up on.
+func hasUnsafeURLCharacters(_ value: String) -> Bool {
+  value.unicodeScalars.contains { $0.value <= 0x20 || $0.value == 0x7F }
+}
+
+/// A server-supplied `value` for a diagnostic or error message: its first 80
+/// Unicode scalars, quoted and escaped, then `…` if there are more. A
+/// megabyte of control characters would otherwise make a 6 MB message.
+func quotedForMessage(_ value: some StringProtocol) -> String {
+  let scalars = value.unicodeScalars
+  let shown = String(String.UnicodeScalarView(scalars.prefix(80))).debugDescription
+  return scalars.dropFirst(80).isEmpty ? shown : shown + "…"
+}
+
+/// A server-supplied token (an `m=` line field) for a diagnostic or error
+/// message: its first 80 Unicode scalars, then `…` if there are more.
+/// Scalars rather than Characters: one Character can hold any number of
+/// combining marks.
+func cutForMessage(_ value: some StringProtocol) -> String {
+  let scalars = value.unicodeScalars
+  let shown = String(String.UnicodeScalarView(scalars.prefix(80)))
+  return scalars.dropFirst(80).isEmpty ? shown : shown + "…"
+}
+
+/// Per-section entries (each already cut) for one diagnostic or error
+/// message: the first three joined by `separator`, then `and N more`. An SDP
+/// of 64 media sections would otherwise make a 10 KB message.
+func listForMessage(_ items: [String], separator: String = ", ") -> String {
+  guard items.count > 3 else { return items.joined(separator: separator) }
+  return items.prefix(3).joined(separator: separator) + separator + "and \(items.count - 3) more"
 }

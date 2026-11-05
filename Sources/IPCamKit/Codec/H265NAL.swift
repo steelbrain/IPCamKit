@@ -6,6 +6,9 @@ import Foundation
 
 /// Whether a unit type is VCL or non-VCL, as defined in T.REC H.265 Table 7-1.
 enum H265UnitTypeClass: Sendable, Equatable {
+  /// `intraCoded` is true for IRAP pictures (types 16...23: BLA, IDR, CRA and
+  /// reserved IRAP types), which contain only I slices and are random access
+  /// points.
   case vcl(intraCoded: Bool)
   case nonVcl
 }
@@ -82,14 +85,14 @@ enum H265UnitType: UInt8, Sendable, CaseIterable {
 
   var unitTypeClass: H265UnitTypeClass {
     switch self {
-    case .idrWRadl, .idrNLp:
+    case .blaWLp, .blaWRadl, .blaNLp,
+      .idrWRadl, .idrNLp,
+      .craNut, .rsvIrapVcl22, .rsvIrapVcl23:
       return .vcl(intraCoded: true)
     case .trailN, .trailR, .tsaN, .tsaR, .stsaN, .stsaR,
       .radlN, .radlR, .raslN, .raslR,
       .rsvVclN10, .rsvVclR11, .rsvVclN12, .rsvVclR13,
       .rsvVclN14, .rsvVclR15,
-      .blaWLp, .blaWRadl, .blaNLp,
-      .craNut, .rsvIrapVcl22, .rsvIrapVcl23,
       .rsvVcl24, .rsvVcl25, .rsvVcl26, .rsvVcl27,
       .rsvVcl28, .rsvVcl29, .rsvVcl30, .rsvVcl31:
       return .vcl(intraCoded: false)

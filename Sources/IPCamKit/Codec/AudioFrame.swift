@@ -33,7 +33,10 @@ struct AudioParameters: Sendable, Equatable {
   /// The length of each frame (in clock_rate units), if fixed.
   var frameLength: UInt32?
 
-  /// The codec clock rate in Hz.
+  /// The clock rate in Hz that `frameLength` and frame timestamps count in.
+  /// For a depacketizer this is the RTP clock rate, which for AAC may be a
+  /// multiple of the AudioSpecificConfig's core sampling rate (HE-AAC/SBR);
+  /// the decoder output rate comes from `extraData` in that case.
   var clockRate: UInt32
 
   /// Codec-specific extra data (e.g. AudioSpecificConfig for AAC).

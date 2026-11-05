@@ -24,6 +24,22 @@ private func makeAACPacket(
   return try! builder.build(payload: payload).get()
 }
 
+/// Base address of the buffer holding the fragment being assembled, found
+/// through `Mirror` because the depacketizer state is private (`path` leads
+/// from `value` to that state). nil when no fragment is in progress. The
+/// reflected copy is released on return, so it doesn't make the next push
+/// copy the buffer.
+private func fragmentBufferAddress(_ value: Any, path: [String]) -> UInt? {
+  var node = value
+  for label in path + ["fragmented", "buf"] {
+    guard let child = Mirror(reflecting: node).children.first(where: { $0.label == label })
+    else { return nil }
+    node = child.value
+  }
+  guard let buf = node as? Data else { return nil }
+  return buf.withUnsafeBytes { UInt(bitPattern: $0.baseAddress) }
+}
+
 @Suite("AAC Tests")
 struct AACTests {
 
@@ -46,6 +62,16 @@ struct AACTests {
     #expect(rfc3640.parameters.clockRate == 48_000)
     #expect(rfc3640.channels.name == "5.1")
     #expect(rfc3640.parameters.rfc6381Codec == "mp4a.40.2")
+  }
+
+  @Test("Blanks around = in the AAC fmtp are tolerated")
+  func fmtpBlanksAroundEquals() throws {
+    let d = try AACDepacketizer(
+      clockRate: 48_000, channels: 1,
+      formatSpecificParams:
+        "streamtype=5; mode = AAC-hbr; SizeLength = 13; IndexLength =3; indexdeltalength= 3; "
+        + "config = 1188")
+    #expect(d.parameters.clockRate == 48_000)
   }
 
   @Test("AAC trusts the ASC over an rtpmap channel mismatch (#5)")
@@ -327,5 +353,59 @@ struct AACTests {
     } else {
       Issue.record("Expected error about mark on fragment start")
     }
+  }
+
+  /// Each continuation packet of a fragmented AU must append to one buffer:
+  /// `state` kept a second reference to it, so every packet copied the whole
+  /// AU so far (an 8000-byte AU in 100-byte pieces moved 78 times).
+  @Test(
+    "Fragmented AU is assembled in one buffer, not copied per packet",
+    .timeLimit(.minutes(1)))
+  func fragmentAppendsInPlace() throws {
+    let size = 8000
+    let au = Data((0..<size).map { UInt8(truncatingIfNeeded: $0) })
+    let auHeader = UInt16(size) << 3  // AU-size=8000 + AU-index=0
+    let header = Data([0x00, 0x10, UInt8(auHeader >> 8), UInt8(auHeader & 0xFF)])
+    let pieces = stride(from: 0, to: size, by: 100).map { au[$0..<min($0 + 100, size)] }
+
+    func run(
+      push: (ReceivedRTPPacket) throws -> Void,
+      pull: () -> Result<CodecItem, DepacketizeError>?,
+      address: () -> UInt?
+    ) throws {
+      var addresses: [UInt] = []
+      for (i, piece) in pieces.enumerated() {
+        let last = i == pieces.count - 1
+        try push(
+          makeAACPacket(seq: UInt16(truncatingIfNeeded: i), mark: last, payload: header + piece))
+        if !last {
+          #expect(pull() == nil)
+          addresses.append(try #require(address()))
+        }
+      }
+      let moves = zip(addresses, addresses.dropFirst()).filter { $0 != $1 }.count
+      #expect(moves == 0, "buffer moved \(moves) times over \(pieces.count) packets")
+      guard case .success(.audioFrame(let frame)) = pull() else {
+        Issue.record("Expected audioFrame from fragment")
+        return
+      }
+      #expect(frame.data == au)
+      // The last piece is appended in place too.
+      #expect(frame.data.withUnsafeBytes { UInt(bitPattern: $0.baseAddress) } == addresses.last)
+      #expect(pull() == nil)
+    }
+
+    // Directly, and through the wrapper the session uses.
+    var d = try AACDepacketizer(
+      clockRate: 48_000, channels: nil, formatSpecificParams: aacFmtp)
+    try run(
+      push: { try d.push($0) }, pull: { d.pull() },
+      address: { fragmentBufferAddress(d, path: ["state"]) })
+    var w = try AudioDepacketizer.create(
+      encodingName: "mpeg4-generic", clockRate: 48_000, channels: nil,
+      formatSpecificParams: aacFmtp)
+    try run(
+      push: { try w.push($0) }, pull: { w.pull() },
+      address: { fragmentBufferAddress(w, path: ["aac", "state"]) })
   }
 }

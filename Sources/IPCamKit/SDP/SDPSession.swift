@@ -30,6 +30,19 @@ public struct SDPSession: Sendable {
   /// Media descriptions
   public var mediaDescriptions: [SDPMediaDescription] = []
 
+  /// One error per media section left out of `mediaDescriptions` because its
+  /// `m=` line couldn't be parsed, in SDP order: the first
+  /// `SDPParser.maxSkippedMediaErrors` of them.
+  var skippedMediaErrors: [String] = []
+  /// How many media sections were left out because their `m=` line couldn't
+  /// be parsed.
+  var skippedMediaCount = 0
+  /// How many well-formed media sections were left out past the parser's
+  /// media limit.
+  var ignoredMediaCount = 0
+  /// How many attributes were left out past the parser's per-section limit.
+  var ignoredAttributeCount = 0
+
   /// Look up a session-level attribute by name (case-insensitive). Returns the
   /// first match.
   public func attribute(_ name: String) -> SDPAttribute? {

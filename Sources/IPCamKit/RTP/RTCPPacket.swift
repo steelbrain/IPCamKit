@@ -15,11 +15,16 @@ let rtcpPayloadTypeSR: UInt8 = 200
 /// Interprets only the leading 4 bytes (common header): version, padding,
 /// count/subtype, payload type, length.
 struct RTCPPacketRef: Sendable {
+  /// The packet's bytes: a slice of the buffer it was parsed from, so its
+  /// `startIndex` may be non-zero.
   let buf: Data
+  /// End of the unpadded payload, as an offset from `buf.startIndex`.
   let payloadEnd: Int
 
   /// Parse one RTCP packet from the beginning of a buffer.
-  /// Returns the parsed packet and remaining bytes.
+  /// Returns the parsed packet and remaining bytes, both slices of `buf`
+  /// sharing its storage: walking a compound packet copies nothing, so it is
+  /// linear in the compound's length.
   static func parse(_ buf: Data) throws -> (RTCPPacketRef, Data) {
     guard buf.count >= rtcpCommonHeaderLen else {
       throw RTSPError.depacketizationError(
@@ -56,15 +61,9 @@ struct RTCPPacketRef: Sendable {
         throw RTSPError.depacketizationError(
           "RTCP packet of len \(len) states invalid \(paddingBytes) padding bytes")
       }
-      return (
-        RTCPPacketRef(buf: Data(packetData), payloadEnd: len - paddingBytes),
-        Data(rest)
-      )
+      return (RTCPPacketRef(buf: packetData, payloadEnd: len - paddingBytes), rest)
     } else {
-      return (
-        RTCPPacketRef(buf: Data(packetData), payloadEnd: len),
-        Data(rest)
-      )
+      return (RTCPPacketRef(buf: packetData, payloadEnd: len), rest)
     }
   }
 
@@ -157,6 +156,7 @@ struct ReceivedCompoundPacket: Sendable {
   let raw: Data
 
   /// Validate a compound packet, returning the first packet on success.
+  /// Each step parses a slice of `raw`, so this is linear in its length.
   static func validate(_ raw: Data) throws -> RTCPPacketRef {
     var (firstPkt, rest) = try RTCPPacketRef.parse(raw)
     var pkt = firstPkt

@@ -79,17 +79,20 @@ public struct NtpTimestamp: Sendable, Equatable, Comparable, CustomStringConvert
     self.rawValue = rawValue
   }
 
-  /// Convert to a Foundation Date. NTP times before the Unix epoch — e.g. an
-  /// unsynced camera that sends 0 — are clamped to 1970-01-01 rather than
-  /// wrapping to an absurd far-future date.
+  /// Convert to a Foundation Date. The 32-bit seconds field wraps on
+  /// 2036-02-07; as RFC 4330 section 3 describes, a value with its top bit
+  /// clear is read as after that date (NTP era 1), and one with it set as
+  /// 1968-2036. Times before the Unix epoch, and 0 (an unsynced camera), are
+  /// clamped to 1970-01-01.
   public var date: Date {
-    guard rawValue >= ntpUnixEpoch.rawValue else {
+    let seconds = rawValue >> 32
+    guard rawValue != 0, seconds & 0x8000_0000 == 0 || rawValue >= ntpUnixEpoch.rawValue else {
       return Date(timeIntervalSince1970: 0)
     }
-    let sinceEpoch = rawValue - ntpUnixEpoch.rawValue
-    let seconds = Double(sinceEpoch >> 32)
-    let fraction = Double(sinceEpoch & 0xFFFF_FFFF) / Double(UInt64(1) << 32)
-    return Date(timeIntervalSince1970: seconds + fraction)
+    let eraSeconds = seconds & 0x8000_0000 == 0 ? seconds + (1 << 32) : seconds
+    let fraction = Double(rawValue & 0xFFFF_FFFF) / Double(UInt64(1) << 32)
+    return Date(
+      timeIntervalSince1970: Double(eraSeconds) - Double(ntpUnixEpoch.rawValue >> 32) + fraction)
   }
 
   public var description: String {

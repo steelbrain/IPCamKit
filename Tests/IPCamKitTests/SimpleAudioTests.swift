@@ -38,6 +38,22 @@ struct SimpleAudioTests {
     #expect(d.frameLength(payloadLen: 321) == nil)
   }
 
+  /// A DVI4 packet's 4-byte header holds no samples: 84 bytes are 160 samples
+  /// (20 ms at 8 kHz), so after a new source the stream continues at the
+  /// frame's end, not 8 ticks later.
+  @Test("DVI4 frame length leaves out the header")
+  func dvi4FrameLength() throws {
+    let depacketizer = try AudioDepacketizer.create(
+      encodingName: "dvi4", clockRate: 8000, channels: nil, formatSpecificParams: nil)
+    guard case .simpleAudio(let d) = depacketizer else {
+      Issue.record("DVI4 isn't a simple audio depacketizer")
+      return
+    }
+    #expect(d.frameLength(payloadLen: 84) == 160)
+    #expect(d.frameLength(payloadLen: 4) == nil)
+    #expect(d.frameLength(payloadLen: 3) == nil)
+  }
+
   /// An oversized payload length must return nil rather than trap the process
   /// (was a precondition on attacker-controlled length — finding #19).
   @Test("Oversized payload length returns nil instead of trapping")

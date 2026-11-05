@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Tests for RTSP Basic and Digest authentication
 
+import CryptoKit
 import Foundation
 import Testing
 
@@ -164,6 +165,33 @@ struct RTSPAuthTests {
     #expect(header?.hasPrefix("Basic ") == true)
   }
 
+  @Test("stale=true counts only for the response that says it")
+  func staleOnlyForItsResponse() {
+    var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    auth.handleChallenges(["Digest realm=\"r\", nonce=\"B\", stale=true"])
+    let sent = auth.sending
+    #expect(auth.retries(afterRejecting: sent))
+    // A later 401 for the same nonce without a usable Digest challenge.
+    auth.handleChallenges(["Basic realm=\"r\""])
+    #expect(!auth.retries(afterRejecting: sent))
+    auth.handleChallenges([String]())
+    #expect(!auth.retries(afterRejecting: sent))
+  }
+
+  @Test("nc keeps counting when a 401 repeats the nonce in use")
+  func ncKeptForSameNonce() {
+    var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    auth.handleChallenges(["Digest realm=\"r\", nonce=\"n1\", qop=\"auth\""])
+    #expect(auth.authorize(method: "PAUSE", uri: "rtsp://h/")?.contains("nc=00000001") == true)
+    // Two in-flight requests refused for the same new nonce.
+    auth.handleChallenges(["Digest realm=\"r\", nonce=\"n2\", qop=\"auth\""])
+    #expect(auth.authorize(method: "PAUSE", uri: "rtsp://h/")?.contains("nc=00000001") == true)
+    auth.handleChallenges(["Digest realm=\"r\", nonce=\"n2\", qop=\"auth\""])
+    #expect(auth.authorize(method: "PLAY", uri: "rtsp://h/")?.contains("nc=00000002") == true)
+    auth.handleChallenges(["Digest realm=\"r\", nonce=\"n3\", qop=\"auth\""])
+    #expect(auth.authorize(method: "PLAY", uri: "rtsp://h/")?.contains("nc=00000001") == true)
+  }
+
   @Test("Basic fallback overrides a broken Digest challenge")
   func basicFallbackOverridesDigest() {
     var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
@@ -209,4 +237,87 @@ struct RTSPAuthTests {
     // Re-emitted escaped: nonce="ab\"cd". (Hash input uses the raw decoded value.)
     #expect(header!.contains("nonce=\"ab\\\"cd\""))
   }
+
+  private func md5Hex(_ text: String) -> String {
+    Insecure.MD5.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+  }
+
+  @Test("Several challenges in one WWW-Authenticate: Digest wins in either order")
+  func digestWinsWithinOneHeader() {
+    let headers: [String] = [
+      "Basic realm=\"cam\", Digest realm=\"cam\", nonce=\"abc\"",
+      "Digest realm=\"cam\", nonce=\"abc\", Basic realm=\"cam\"",
+      "Basic realm=\"cam\",Digest realm=\"cam\",nonce=\"abc\"",
+    ]
+    let ha1 = md5Hex("u:cam:p")
+    let ha2 = md5Hex("DESCRIBE:rtsp://h/p")
+    let response = md5Hex("\(ha1):abc:\(ha2)")
+    for header in headers {
+      var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+      auth.handleChallenges([header])
+      #expect(auth.usesDigest, "\(header)")
+      #expect(auth.hasBasicChallenge, "\(header)")
+      let authorization: String = auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p") ?? ""
+      #expect(authorization.hasPrefix("Digest "), "\(header)")
+      #expect(authorization.contains("realm=\"cam\", nonce=\"abc\""), "\(header)")
+      #expect(authorization.contains("response=\"\(response)\""), "\(header)")
+      // The Digest -> Basic fallback works from the same header.
+      let fallback: String? = auth.authorizeBasicFallback()
+      #expect(fallback?.hasPrefix("Basic ") == true, "\(header)")
+    }
+  }
+
+  @Test("Quoted commas and scheme names don't split challenges; other schemes are skipped")
+  func challengeSplittingHonorsQuotes() {
+    var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    // Wire text: Negotiate abc==, Basic realm="x, Digest y=\"z\"",
+    //   Digest realm = "cam, Basic", nonce="n, Basic m", stale=FALSE
+    let header: String =
+      "Negotiate abc==, Basic realm=\"x, Digest y=\\\"z\\\"\", "
+      + "Digest realm = \"cam, Basic\", nonce=\"n, Basic m\", stale=FALSE"
+    auth.handleChallenges([header])
+    #expect(auth.usesDigest)
+    #expect(auth.hasBasicChallenge)
+    let authorization: String = auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p") ?? ""
+    #expect(authorization.contains("realm=\"cam, Basic\", nonce=\"n, Basic m\""))
+    let ha1 = md5Hex("u:cam, Basic:p")
+    let ha2 = md5Hex("DESCRIBE:rtsp://h/p")
+    let response = md5Hex("\(ha1):n, Basic m:\(ha2)")
+    #expect(authorization.contains("response=\"\(response)\""))
+
+    // A quoted ", Basic ..." inside a Digest value offers no Basic.
+    var quoted = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    quoted.handleChallenges(["Digest realm=\"a, Basic b=\\\"c\\\", d\", nonce=\"abc\""])
+    #expect(quoted.usesDigest)
+    #expect(!quoted.hasBasicChallenge)
+    let echoed: String = quoted.authorize(method: "DESCRIBE", uri: "rtsp://h/p") ?? ""
+    #expect(echoed.contains("realm=\"a, Basic b=\\\"c\\\", d\""))
+  }
+
+  @Test("Challenges split into scheme and parameters per RFC 7235")
+  func splitChallengesShapes() {
+    let split = RTSPAuthenticator.splitChallenges(
+      "Basic, Digest realm=\"r\", qop=\"auth,auth-int\", Negotiate a1b2==, NTLM")
+    let schemes: [String] = split.map { $0.scheme }
+    #expect(schemes == ["Basic", "Digest", "Negotiate", "NTLM"])
+    let params: [[String]] = split.map { $0.params }
+    #expect(params == [[], ["realm=\"r\"", "qop=\"auth,auth-int\""], ["a1b2=="], []])
+    // Parameters before any scheme belong to no challenge.
+    #expect(RTSPAuthenticator.splitChallenges("realm=\"r\", nonce=\"n\"").isEmpty)
+  }
+
+  @Test("An unquoted qop list doesn't split the Digest challenge")
+  func unquotedQopList() throws {
+    let value = "Digest realm=\"cam\", qop=auth,auth-int, nonce=\"abc\", Negotiate"
+    let challenges = RTSPAuthenticator.splitChallenges(value)
+    #expect(challenges.map(\.scheme) == ["Digest", "Negotiate"])
+    var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    auth.handleChallenges([value])
+    #expect(auth.usesDigest)
+    let authorization = auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p")
+    let header = try #require(authorization)
+    #expect(header.contains("nonce=\"abc\""))
+    #expect(header.contains("qop=auth"))
+  }
+
 }

@@ -10,10 +10,13 @@
 // rejects a SETUP for the other, so the client cannot silently fall back.
 //
 // These tests REQUIRE `ffmpeg` and `mediamtx` on `PATH` (see README "Testing").
+// The RTSPS tests also run `/usr/bin/openssl` (LibreSSL, part of macOS) to mint
+// a throwaway self-signed server certificate.
 // They are serialized so only one server/publisher pair runs at a time.
 
 import Foundation
 import Network
+import Security
 import Testing
 
 @testable import IPCamKit
@@ -118,10 +121,11 @@ private func reserveListener(
 /// distinct and free, then released for the child process. There is a small
 /// TOCTOU window, but the live suite is serialized and binds the ports
 /// immediately. The UDP pair is reserved with UDP listeners (not TCP) so the
-/// ports are free in the protocol MediaMTX actually binds them in.
+/// ports are free in the protocol MediaMTX actually binds them in. With
+/// `rtsps`, a second TCP port is reserved for the RTSPS (TLS) listener.
 func reserveServerPorts(
-  family: LiveIPFamily
-) -> (rtsp: UInt16, rtp: UInt16, rtcp: UInt16)? {
+  family: LiveIPFamily, rtsps: Bool = false
+) -> (rtsp: UInt16, rtsps: UInt16?, rtp: UInt16, rtcp: UInt16)? {
   let queue = DispatchQueue(label: "ipcamkit.live.reserve")
   var held: [NWListener] = []
   defer { for listener in held { listener.cancel() } }
@@ -130,6 +134,14 @@ func reserveServerPorts(
     return nil
   }
   held.append(rtsp.listener)
+  var rtspsPort: UInt16?
+  if rtsps {
+    guard let tls = reserveListener(.tcp, family: family, port: 0, queue: queue) else {
+      return nil
+    }
+    held.append(tls.listener)
+    rtspsPort = tls.port
+  }
 
   for _ in 0..<400 {
     guard let candidate = reserveListener(.udp, family: family, port: 0, queue: queue) else {
@@ -141,7 +153,7 @@ func reserveServerPorts(
     {
       held.append(candidate.listener)
       held.append(next.listener)
-      return (rtsp.port, base, base + 1)
+      return (rtsp.port, rtspsPort, base, base + 1)
     }
     candidate.listener.cancel()
   }
@@ -191,14 +203,29 @@ private func canConnectLoopback(family: LiveIPFamily, _ port: UInt16) -> Bool {
 /// `shutDown` (after `start()` has fully completed — a happens-before barrier).
 final class LiveStreamFixture: @unchecked Sendable {
   private(set) var rtspURL = ""
+  /// `rtsps://` URL of the same stream on the TLS listener (only with `tls`).
+  private(set) var rtspsURL = ""
+  /// The TLS listener's self-signed certificate, DER-encoded (only with `tls`).
+  private(set) var certificateDER = Data()
+  /// `openssl x509 -fingerprint -sha256` output for that certificate, e.g.
+  /// `SHA256 Fingerprint=09:1B:…` (only with `tls`).
+  private(set) var opensslFingerprintLine = ""
 
   private let transports: [String]
+  private let tls: Bool
   private let family: LiveIPFamily
   private let readTimeoutSeconds: Int?
   private let ffmpegArgs: [String]
   private let marker: String
+  /// This fixture's own directory for its files. mediamtx watches its config
+  /// file's directory and exits when a file there vanishes before it can
+  /// `lstat` it, which other programs' temp files in the shared temp directory
+  /// trigger. The parent directory is never removed.
+  private let directory: String
   private let configPath: String
   private let logPath: String
+  private let certPath: String
+  private let keyPath: String
   private let queue: DispatchQueue
   private let mediamtx = Process()
   private let ffmpeg = Process()
@@ -212,20 +239,28 @@ final class LiveStreamFixture: @unchecked Sendable {
   ///     (inputs + codec options); the `-f rtsp ... <url>` tail is appended.
   ///   - family: loopback address family the server binds and the client/ffmpeg
   ///     reach it over (`127.0.0.1` for IPv4, `[::1]` for IPv6).
+  ///   - tls: also serve the stream over RTSPS (`rtspEncryption: optional`)
+  ///     with a fresh self-signed certificate for `localhost`, `127.0.0.1`, and
+  ///     `::1`. ffmpeg still publishes over plain RTSP; clients read `rtspsURL`.
   init(
     transports: [String],
     family: LiveIPFamily = .ipv4,
+    tls: Bool = false,
     readTimeoutSeconds: Int? = nil,
     ffmpegArgs: [String]
   ) {
     let token = UUID().uuidString.prefix(8)
     self.transports = transports
+    self.tls = tls
     self.family = family
     self.readTimeoutSeconds = readTimeoutSeconds
     self.ffmpegArgs = ffmpegArgs
     self.marker = "ipcamkit-live-\(token)"
-    self.configPath = NSTemporaryDirectory() + "ipcamkit-live-\(token).yml"
-    self.logPath = NSTemporaryDirectory() + "ipcamkit-live-\(token).log"
+    self.directory = NSTemporaryDirectory() + "ipcamkit-live-fixtures/\(marker)/"
+    self.configPath = directory + "mediamtx.yml"
+    self.logPath = directory + "mediamtx.log"
+    self.certPath = directory + "server.crt"
+    self.keyPath = directory + "server.key"
     self.queue = DispatchQueue(label: "ipcamkit.live.\(token)")
   }
 
@@ -250,14 +285,28 @@ final class LiveStreamFixture: @unchecked Sendable {
   }
 
   private func startSync() throws {
-    guard let ports = reserveServerPorts(family: family) else {
+    try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    guard let ports = reserveServerPorts(family: family, rtsps: tls) else {
       throw LiveError("could not reserve RTSP + RTP/RTCP server ports")
     }
     rtspURL = "rtsp://\(family.urlHost):\(ports.rtsp)/\(marker)"
 
+    var tlsLines = ""
+    if tls, let rtspsPort = ports.rtsps {
+      try makeSelfSignedCertificate()
+      rtspsURL = "rtsps://\(family.urlHost):\(rtspsPort)/\(marker)"
+      tlsLines = """
+        rtspEncryption: optional
+        rtspsAddress: '\(family.mediamtxAddress(rtspsPort))'
+        rtspServerKey: '\(keyPath)'
+        rtspServerCert: '\(certPath)'
+
+        """
+    }
+
     let readTimeoutLine = readTimeoutSeconds.map { "readTimeout: \($0)s\n" } ?? ""
     let config = """
-      \(readTimeoutLine)logLevel: error
+      \(readTimeoutLine)\(tlsLines)logLevel: error
       api: false
       metrics: false
       pprof: false
@@ -309,9 +358,13 @@ final class LiveStreamFixture: @unchecked Sendable {
 
     // Blocking poll on this private thread (≈10s budget): fine here, off the
     // cooperative pool.
+    // With TLS, the RTSPS listener must be up too: the TLS rejection tests
+    // connect without retrying, so a not-yet-listening port would fail them
+    // with "connection refused" instead of the certificate error.
+    let listenPorts = [ports.rtsp] + (ports.rtsps.map { [$0] } ?? [])
     var opened = false
     for _ in 0..<67 {
-      if canConnectLoopback(family: family, ports.rtsp) {
+      if listenPorts.allSatisfy({ canConnectLoopback(family: family, $0) }) {
         opened = true
         break
       }
@@ -320,11 +373,56 @@ final class LiveStreamFixture: @unchecked Sendable {
     guard opened else {
       let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "<no log>"
       throw LiveError(
-        "mediamtx RTSP port \(ports.rtsp) did not open within 10s. mediamtx log:\n\(log)")
+        "mediamtx ports \(listenPorts) did not open within 10s. mediamtx log:\n\(log)")
     }
 
     try ffmpeg.run()
     launched.append(ffmpeg)
+  }
+
+  /// Write a fresh self-signed certificate and key for the RTSPS listener, and
+  /// record its DER encoding and openssl's SHA-256 fingerprint line. Uses the
+  /// system LibreSSL so CI needs nothing beyond macOS. The EC key is written
+  /// with a named curve (LibreSSL's default is explicit curve parameters, which
+  /// Go's TLS stack in mediamtx rejects).
+  private func makeSelfSignedCertificate() throws {
+    _ = try runOpenSSL([
+      "req", "-x509", "-newkey", "ec",
+      "-pkeyopt", "ec_paramgen_curve:prime256v1", "-pkeyopt", "ec_param_enc:named_curve",
+      "-nodes", "-keyout", keyPath, "-out", certPath, "-days", "2", "-subj", "/CN=localhost",
+      "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
+      "-addext", "extendedKeyUsage=serverAuth",
+    ])
+    opensslFingerprintLine = try runOpenSSL([
+      "x509", "-in", certPath, "-noout", "-fingerprint", "-sha256",
+    ]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    let pem = try String(contentsOfFile: certPath, encoding: .utf8)
+    let base64 = pem.split(separator: "\n").filter { !$0.hasPrefix("-----") }.joined()
+    guard let der = Data(base64Encoded: base64) else {
+      throw LiveError("could not decode the generated certificate PEM")
+    }
+    certificateDER = der
+  }
+
+  /// Run `/usr/bin/openssl` with `arguments`; return stdout, throw on failure.
+  private func runOpenSSL(_ arguments: [String]) throws -> String {
+    let process = Process()
+    let stdout = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
+    process.arguments = arguments
+    process.standardOutput = stdout
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    // Output is a few lines, well under the pipe buffer, so reading after exit
+    // cannot deadlock.
+    process.waitUntilExit()
+    let output = String(
+      decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    guard process.terminationStatus == 0 else {
+      throw LiveError("openssl \(arguments.first ?? "") exited \(process.terminationStatus)")
+    }
+    return output
   }
 
   /// Terminate both processes and remove the temp files. Runs on the calling
@@ -343,8 +441,7 @@ final class LiveStreamFixture: @unchecked Sendable {
     pkill.environment = Self.childEnvironment()
     try? pkill.run()
 
-    try? FileManager.default.removeItem(atPath: configPath)
-    try? FileManager.default.removeItem(atPath: logPath)
+    try? FileManager.default.removeItem(atPath: directory)
   }
 }
 
@@ -363,7 +460,7 @@ private actor ItemSink {
 
 /// Thread-safe collector for the `RTSPDiagnostic` messages a session emits via
 /// its synchronous `onDiagnostic` callback.
-private final class DiagnosticLog: @unchecked Sendable {
+final class DiagnosticLog: @unchecked Sendable {
   private let lock = NSLock()
   private var messages: [String] = []
   func add(_ message: String) {
@@ -494,9 +591,44 @@ private func liveWatchdog(_ cap: Duration) -> Task<Void, Never> {
   }
 }
 
+// MARK: - RTSPS helpers
+
+/// ffmpeg input + encoder args for a 15 fps H.264 test pattern with no audio.
+private let h264VideoOnlyArgs = [
+  "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+  "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+  "-g", "15", "-pix_fmt", "yuv420p", "-an",
+]
+
+/// The pin a user would configure for the fixture's certificate: the hex part
+/// of openssl's `SHA256 Fingerprint=…` line, as copied from a terminal.
+private func opensslPin(_ fixture: LiveStreamFixture) throws -> CertificateFingerprint {
+  let line = fixture.opensslFingerprintLine
+  let hex = line.split(separator: "=", maxSplits: 1).last.map(String.init) ?? ""
+  return try #require(CertificateFingerprint(hex: hex), "unparseable openssl line: \(line)")
+}
+
+/// Expect `start()` to fail because the server certificate was rejected (not
+/// with a network error).
+private func expectTLSRejection(
+  _ session: RTSPClientSession, sourceLocation: SourceLocation = #_sourceLocation
+) async {
+  do {
+    _ = try await session.start()
+    Issue.record("start() should fail the TLS handshake", sourceLocation: sourceLocation)
+  } catch RTSPError.connectionFailed(let message) {
+    #expect(
+      message.hasPrefix("TLS handshake failed: server certificate rejected"), "got: \(message)",
+      sourceLocation: sourceLocation)
+  } catch {
+    Issue.record("expected connectionFailed, got \(error)", sourceLocation: sourceLocation)
+  }
+  await session.stop()
+}
+
 // MARK: - Tests
 
-@Suite("Live Integration Tests", .serialized)
+@Suite("Live Integration Tests", .serialized, .liveServer)
 struct LiveIntegrationTests {
 
   @Test("H.264 over interleaved TCP yields a keyframe with in-band SPS/PPS")
@@ -712,7 +844,7 @@ struct LiveIntegrationTests {
       RTSPClientSession(
         url: fixture.rtspURL, credentials: nil, transport: .tcp,
         userAgent: "IPCamKit", onDiagnostic: { log.add($0.message) },
-        keepaliveInterval: .seconds(1))
+        keepaliveInterval: .seconds(1), receiverReportInterval: .milliseconds(500))
     }
 
     // Run until a frame arrives from well past the 3s read-timeout window.
@@ -727,6 +859,9 @@ struct LiveIntegrationTests {
       "stream should survive well past the 3s read timeout via keepalive")
     let acked = log.all.filter { $0.contains("keepalive") && $0.contains("acknowledged") }
     #expect(!acked.isEmpty, "expected an acknowledged keepalive; diagnostics: \(log.all)")
+    // Receiver reports went out every 500 ms on the same connection without
+    // ending the session.
+    #expect(!log.all.contains { $0.contains("receiver report") }, "\(log.all)")
   }
 
   // MARK: - UDP transport
@@ -923,5 +1058,201 @@ struct LiveIntegrationTests {
     #expect(ppsAvailable, "expected PPS via SDP or in-band")
 
     await session.stop()
+  }
+
+  // MARK: - RTSPS (RTSP over TLS)
+
+  @Test("H.264 + AAC over RTSPS with a pinned self-signed certificate")
+  func h264AacOverRTSPSPinned() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    // mediamtx serves the stream on a plain RTSP listener (ffmpeg publishes
+    // there) and on an RTSPS listener; the client reads only over TLS, with RTP
+    // interleaved inside the TLS connection.
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      tls: true,
+      ffmpegArgs: [
+        "-re",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000",
+      ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+    let pin = try opensslPin(fixture)
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(
+        url: fixture.rtspsURL, transport: .tcp, tls: TLSOptions(serverTrust: .pinned([pin])))
+    }
+    #expect(desc.video?.codec == .h264)
+    #expect(desc.audio?.sampleRate == 48000)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      let vf = videoFrames($0)
+      return vf.count >= 3 && vf.contains { $0.isKeyframe } && audioFrames($0).count >= 2
+    }
+
+    let vf = videoFrames(items)
+    #expect(vf.count >= 3, "expected video frames over RTSPS")
+    #expect(vf.contains { $0.isKeyframe }, "expected a keyframe (IDR) over RTSPS")
+    expectRawNALUnits(vf, codec: .h264)
+    let af = audioFrames(items)
+    #expect(af.count >= 2, "expected audio frames over RTSPS")
+    #expect(af.allSatisfy { $0.sampleRate == 48000 }, "audio sample rate should be 48 kHz")
+
+    // TEARDOWN goes out on the TLS connection while the reader loop owns it;
+    // the 45s watchdog fails the test if stop() hangs.
+    await session.stop()
+  }
+
+  @Test("Keepalive over RTSPS sustains a session past the server read timeout")
+  func keepaliveOverRTSPS() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    // As keepaliveSustainsSession, but the keepalive requests are written into
+    // the TLS connection while the reader loop is receiving on it.
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"], tls: true, readTimeoutSeconds: 3, ffmpegArgs: h264VideoOnlyArgs)
+    defer { fixture.shutDown() }
+    try await fixture.start()
+    let pin = try opensslPin(fixture)
+
+    let log = DiagnosticLog()
+    let (session, _) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(
+        url: fixture.rtspsURL, credentials: nil, transport: .tcp,
+        tls: TLSOptions(serverTrust: .pinned([pin])),
+        userAgent: "IPCamKit", onDiagnostic: { log.add($0.message) },
+        keepaliveInterval: .seconds(1), receiverReportInterval: .milliseconds(500))
+    }
+
+    let items = await collectItems(from: session, deadline: .seconds(20)) {
+      videoFrames($0).contains { $0.timestamp > 6.0 }
+    }
+    await session.stop()
+
+    #expect(
+      videoFrames(items).contains { $0.timestamp > 6.0 },
+      "stream should survive well past the 3s read timeout via keepalive over TLS")
+    let acked = log.all.filter { $0.contains("keepalive") && $0.contains("acknowledged") }
+    #expect(!acked.isEmpty, "expected an acknowledged keepalive; diagnostics: \(log.all)")
+    // Receiver reports went out every 500 ms on the same connection without
+    // ending the session.
+    #expect(!log.all.contains { $0.contains("receiver report") }, "\(log.all)")
+  }
+
+  @Test("RTSPS with system trust rejects a self-signed certificate")
+  func rtspsSystemTrustRejectsSelfSigned() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"], tls: true, ffmpegArgs: h264VideoOnlyArgs)
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    // Default TLSOptions: the self-signed certificate chains to no trusted root.
+    let session = RTSPClientSession(url: fixture.rtspsURL, transport: .tcp)
+    let began = ContinuousClock.now
+    await expectTLSRejection(session)
+    #expect(
+      ContinuousClock.now - began < .seconds(10),
+      "should fail on the certificate, not wait out the 15s connect timeout")
+  }
+
+  @Test("RTSPS rejects a certificate that does not match the pin")
+  func rtspsWrongPinRejected() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"], tls: true, ffmpegArgs: h264VideoOnlyArgs)
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let actual = try opensslPin(fixture)
+    let wrong = try #require(CertificateFingerprint(sha256: Data(repeating: 0x5A, count: 32)))
+    #expect(wrong != actual)
+    let session = RTSPClientSession(
+      url: fixture.rtspsURL, transport: .tcp, tls: TLSOptions(serverTrust: .pinned([wrong])))
+    await expectTLSRejection(session)
+  }
+
+  @Test("RTSPS custom evaluator sees the server certificate and can anchor-trust it")
+  func rtspsCustomEvaluator() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"], tls: true, ffmpegArgs: h264VideoOnlyArgs)
+    defer { fixture.shutDown() }
+    try await fixture.start()
+    let pin = try opensslPin(fixture)
+
+    // Trust the fixture's certificate as the only anchor and run the full
+    // platform evaluation, which also checks the SSL policy's host name
+    // (127.0.0.1 against the certificate's IP SAN) and validity dates.
+    let anchorDER = fixture.certificateDER
+    let seenLeaves = DiagnosticLog()
+    let evaluator: @Sendable (SecTrust) -> Bool = { trust in
+      if let leaf = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first {
+        seenLeaves.add(CertificateFingerprint(certificate: leaf).description)
+      }
+      guard let anchor = SecCertificateCreateWithData(nil, anchorDER as CFData) else {
+        return false
+      }
+      SecTrustSetAnchorCertificates(trust, [anchor] as CFArray)
+      SecTrustSetAnchorCertificatesOnly(trust, true)
+      var error: CFError?
+      let trusted = SecTrustEvaluateWithError(trust, &error)
+      if !trusted { seenLeaves.add("evaluation failed: \(String(describing: error))") }
+      return trusted
+    }
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(
+        url: fixture.rtspsURL, transport: .tcp, tls: TLSOptions(serverTrust: .custom(evaluator)))
+    }
+    #expect(desc.video?.codec == .h264)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      videoFrames($0).contains { $0.isKeyframe }
+    }
+    await session.stop()
+
+    #expect(videoFrames(items).contains { $0.isKeyframe }, "expected a keyframe over RTSPS")
+    // One entry per handshake (startSessionWithRetry may retry on 404s); every
+    // one must be the fixture's certificate, and no evaluation may have failed.
+    #expect(!seenLeaves.all.isEmpty, "the custom evaluator was never called")
+    #expect(Set(seenLeaves.all) == [pin.description], "evaluator saw: \(seenLeaves.all)")
+  }
+
+  @Test("H.264 over RTSPS on IPv6 (::1) with a pinned certificate")
+  func h264OverRTSPSIPv6() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"], family: .ipv6, tls: true, ffmpegArgs: h264VideoOnlyArgs)
+    defer { fixture.shutDown() }
+    try await fixture.start()
+    let pin = try opensslPin(fixture)
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(
+        url: fixture.rtspsURL, transport: .tcp, tls: TLSOptions(serverTrust: .pinned([pin])))
+    }
+    #expect(desc.video?.codec == .h264)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      let vf = videoFrames($0)
+      return vf.count >= 3 && vf.contains { $0.isKeyframe }
+    }
+    await session.stop()
+
+    let vf = videoFrames(items)
+    #expect(vf.count >= 3, "expected video frames over IPv6 RTSPS")
+    #expect(vf.contains { $0.isKeyframe }, "expected a keyframe (IDR) over IPv6 RTSPS")
   }
 }

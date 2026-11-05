@@ -11,11 +11,21 @@ import Foundation
 /// - Aggregation (multiple AUs per packet)
 /// - Fragmentation (single AU split across packets)
 /// - Loss tracking (prevLoss vs lossSinceMark)
+///
+/// Error recovery: a packet that can't be used (a malformed packet, or one
+/// that contradicts the fragment in progress) is dropped together with any
+/// fragment in progress, and counts as one lost packet on the next frame, so
+/// one bad packet never wedges the depacketizer. A fragment whose remaining
+/// packets never arrive (a packet with a new timestamp, or with several AUs,
+/// comes instead) is abandoned the same way and the new packet is processed.
 struct AACDepacketizer: Sendable {
-  private let config: AudioSpecificConfig
-  var parameters: AudioParameters {
-    config.parameters
-  }
+  /// RTP clock ticks per AU: the AU's samples at the AudioSpecificConfig's
+  /// core sampling rate, scaled by the RTP clock rate's multiple of that rate
+  /// (e.g. 2048 for HE-AAC with a 24 kHz core on a 48 kHz RTP clock).
+  private let ticksPerAU: UInt32
+  /// Stream parameters in RTP clock units: `clockRate` is the RTP clock rate
+  /// and `frameLength` is the RTP ticks per AU.
+  let parameters: AudioParameters
   private var state: DepacketizerState
 
   init(
@@ -30,7 +40,17 @@ struct AACDepacketizer: Sendable {
     // The rtpmap channel count (`channels`) is informational and frequently
     // wrong or omitted on real cameras, so do not reject on mismatch — trust
     // the ASC. `channels` is retained in the signature for API compatibility.
-    self.config = config
+    //
+    // parseAACFormatSpecificParams has checked that clockRate is a 1x-4x
+    // multiple of the core sampling rate.
+    guard let ticksPerAU = config.rtpTicksPerAU(clockRate: clockRate) else {
+      throw DepacketizeError("unsupported RTP clock rate \(clockRate) for AAC")
+    }
+    self.ticksPerAU = ticksPerAU
+    var parameters = config.parameters
+    parameters.clockRate = clockRate
+    parameters.frameLength = ticksPerAU
+    self.parameters = parameters
     self.state = .idle(prevLoss: 0, lossSinceMark: false)
   }
 
@@ -73,17 +93,30 @@ struct AACDepacketizer: Sendable {
     var buf: Data
   }
 
-  // MARK: - Push
+  /// Saturating sum of loss counts.
+  private static func sum(_ values: UInt16...) -> UInt16 {
+    UInt16(clamping: values.reduce(UInt32(0)) { $0 + UInt32($1) })
+  }
 
-  mutating func push(_ pkt: ReceivedRTPPacket) throws {
-    // If there's loss and we're mid-fragment, discard the fragment.
-    if pkt.loss > 0 {
-      if case .fragmented(let f) = state {
-        state = .idle(prevLoss: f.loss, lossSinceMark: true)
-      }
+  /// Drops `pkt` after an error, along with any fragment in progress: the next
+  /// frame reports the loss so far plus one for the dropped data. After an
+  /// unmarked packet the stream is mid-AU, so `lossSinceMark` is set and the
+  /// rest of that AU is dropped quietly.
+  private mutating func dropPacket(_ pkt: ReceivedRTPPacket) {
+    switch state {
+    case .idle(let prevLoss, _):
+      state = .idle(prevLoss: Self.sum(prevLoss, pkt.loss, 1), lossSinceMark: !pkt.mark)
+    case .fragmented(let frag):
+      state = .idle(prevLoss: Self.sum(frag.loss, pkt.loss, 1), lossSinceMark: !pkt.mark)
+    case .aggregated, .ready:
+      // Frames are still pending (push before pull drained them); keep them.
+      break
     }
+  }
 
-    let payload = pkt.payload
+  /// The AU-header count and the payload offset of the first AU's data.
+  private static func parseAUHeadersLength(_ payload: Data) throws -> (count: UInt16, dataOff: Int)
+  {
     guard payload.count >= 2 else {
       throw DepacketizeError("packet too short for au-header-length")
     }
@@ -102,74 +135,108 @@ struct AACDepacketizer: Sendable {
     guard payload.count >= dataOff else {
       throw DepacketizeError("packet too short for au-headers")
     }
+    return (auHeadersCount, dataOff)
+  }
 
-    switch state {
-    case .fragmented(var frag):
-      guard auHeadersCount == 1 else {
-        throw DepacketizeError(
-          "Got \(auHeadersCount)-AU packet while fragment in progress")
+  // MARK: - Push
+
+  mutating func push(_ pkt: ReceivedRTPPacket) throws {
+    // If there's loss and we're mid-fragment, discard the fragment.
+    if pkt.loss > 0 {
+      if case .fragmented(let f) = state {
+        state = .idle(prevLoss: f.loss, lossSinceMark: true)
       }
+    }
+
+    let payload = pkt.payload
+    let auHeadersCount: UInt16
+    let dataOff: Int
+    do {
+      (auHeadersCount, dataOff) = try Self.parseAUHeadersLength(payload)
+    } catch {
+      dropPacket(pkt)
+      throw error
+    }
+
+    if case .fragmented(var frag) = state {
       // Compare the full 32-bit wire timestamp: a UInt16 narrowing could let two
       // genuinely different timestamps whose low 16 bits collide be mis-stitched.
       let pktTs = UInt32(truncatingIfNeeded: pkt.timestamp.timestamp)
-      guard pktTs == frag.rtpTimestamp else {
-        throw DepacketizeError(
-          "Timestamp changed from 0x\(String(frag.rtpTimestamp, radix: 16)) "
-            + "to 0x\(String(pktTs, radix: 16)) mid-fragment")
-      }
-      let auHeader =
-        UInt16(payload[payload.startIndex + 2]) << 8
-        | UInt16(payload[payload.startIndex + 3])
-      let size = Int(auHeader >> 3)
-      guard size == Int(frag.size) else {
-        throw DepacketizeError(
-          "size changed \(frag.size)->\(size) mid-fragment")
-      }
-      let data = payload[(payload.startIndex + dataOff)...]
-      let totalLen = frag.buf.count + data.count
-      if totalLen < size {
-        // Still incomplete
-        if pkt.mark {
-          if frag.lossSinceMark {
-            state = .idle(prevLoss: frag.loss, lossSinceMark: false)
-            return
-          }
-          throw DepacketizeError(
-            "frag marked complete when \(frag.buf.count)+\(data.count)<\(size)")
-        }
-        frag.buf.append(contentsOf: data)
-        state = .fragmented(frag)
-      } else if totalLen == size {
-        guard pkt.mark else {
-          throw DepacketizeError(
-            "frag not marked complete when full data present")
-        }
-        frag.buf.append(contentsOf: data)
-        state = .ready(
-          AudioFrame(
-            ctx: pkt.ctx,
-            streamId: pkt.streamId,
-            timestamp: pkt.timestamp,
-            frameLength: UInt32(config.frameLength),
-            loss: frag.loss,
-            data: frag.buf
-          ))
+      if auHeadersCount != 1 || pktTs != frag.rtpTimestamp {
+        // The fragment's remaining packets never came, yet nothing was lost in
+        // transit (that case is handled above): abandon the fragment, count
+        // the dropped AU as loss, and process this packet afresh below.
+        state = .idle(prevLoss: Self.sum(frag.loss, 1), lossSinceMark: true)
       } else {
-        throw DepacketizeError("too much data in fragment")
+        let auHeader =
+          UInt16(payload[payload.startIndex + 2]) << 8
+          | UInt16(payload[payload.startIndex + 3])
+        let size = Int(auHeader >> 3)
+        guard size == Int(frag.size) else {
+          dropPacket(pkt)
+          throw DepacketizeError(
+            "size changed \(frag.size)->\(size) mid-fragment")
+        }
+        let data = payload[(payload.startIndex + dataOff)...]
+        let totalLen = frag.buf.count + data.count
+        if totalLen < size {
+          // Still incomplete
+          if pkt.mark {
+            if frag.lossSinceMark {
+              state = .idle(prevLoss: frag.loss, lossSinceMark: false)
+              return
+            }
+            dropPacket(pkt)
+            throw DepacketizeError(
+              "frag marked complete when \(frag.buf.count)+\(data.count)<\(size)")
+          }
+          // `state` still holds the buffer; release it first so the append
+          // grows `frag.buf` in place instead of copying it every packet.
+          state = .idle(prevLoss: 0, lossSinceMark: false)
+          frag.buf.append(contentsOf: data)
+          state = .fragmented(frag)
+        } else if totalLen == size {
+          guard pkt.mark else {
+            dropPacket(pkt)
+            throw DepacketizeError(
+              "frag not marked complete when full data present")
+          }
+          state = .idle(prevLoss: 0, lossSinceMark: false)  // as above
+          frag.buf.append(contentsOf: data)
+          state = .ready(
+            AudioFrame(
+              ctx: pkt.ctx,
+              streamId: pkt.streamId,
+              timestamp: pkt.timestamp,
+              frameLength: ticksPerAU,
+              loss: frag.loss,
+              data: frag.buf
+            ))
+        } else {
+          dropPacket(pkt)
+          throw DepacketizeError("too much data in fragment")
+        }
+        return
       }
+    }
+
+    switch state {
+    case .fragmented:
+      preconditionFailure("fragment state handled above")
 
     case .aggregated:
       preconditionFailure("push when already in state aggregated")
 
     case .idle(let prevLoss, let lossSinceMark):
       guard auHeadersCount > 0 else {
+        dropPacket(pkt)
         throw DepacketizeError("aggregate with no headers")
       }
       let loss = pkt.loss
       state = .aggregated(
         Aggregate(
           pkt: pkt,
-          loss: UInt16(clamping: UInt32(prevLoss) + UInt32(loss)),
+          loss: Self.sum(prevLoss, loss),
           lossSinceMark: lossSinceMark || loss > 0,
           frameI: 0,
           frameCount: auHeadersCount,
@@ -191,6 +258,13 @@ struct AACDepacketizer: Sendable {
       sequenceNumber: pkt.sequenceNumber, description: description)
   }
 
+  /// Drops the rest of `agg`'s packet after a failure. The next frame
+  /// reports the loss so far plus one for the dropped AU(s); after an
+  /// unmarked packet the rest of that AU is dropped quietly.
+  private mutating func failPacket(_ agg: Aggregate) {
+    state = .idle(prevLoss: Self.sum(agg.loss, 1), lossSinceMark: !agg.pkt.mark)
+  }
+
   mutating func pull() -> Result<CodecItem, DepacketizeError>? {
     switch state {
     case .idle, .fragmented:
@@ -210,7 +284,7 @@ struct AACDepacketizer: Sendable {
       let size = Int(auHeader >> 3)
       let index = auHeader & 0b111
       if index != 0 {
-        state = .idle(prevLoss: 0, lossSinceMark: false)
+        failPacket(agg)
         return .failure(
           makeError(agg.pkt, "interleaving not yet supported"))
       }
@@ -219,7 +293,7 @@ struct AACDepacketizer: Sendable {
       if size > remainingData {
         // Start of fragment
         if agg.frameCount != 1 {
-          state = .idle(prevLoss: 0, lossSinceMark: false)
+          failPacket(agg)
           return .failure(
             makeError(
               agg.pkt, "fragmented AUs must not share packets"))
@@ -229,7 +303,7 @@ struct AACDepacketizer: Sendable {
             state = .idle(prevLoss: agg.loss, lossSinceMark: false)
             return nil
           }
-          state = .idle(prevLoss: 0, lossSinceMark: false)
+          failPacket(agg)
           return .failure(
             makeError(
               agg.pkt,
@@ -251,16 +325,17 @@ struct AACDepacketizer: Sendable {
       }
 
       if !mark {
-        state = .idle(prevLoss: 0, lossSinceMark: false)
+        failPacket(agg)
         return .failure(
           makeError(
             agg.pkt, "mark must be set on non-fragmented au"))
       }
 
-      let delta = UInt32(agg.frameI) * UInt32(config.frameLength)
+      // At most 4095 AUs of at most 4096 ticks: no UInt32 overflow.
+      let delta = UInt32(agg.frameI) * ticksPerAU
       guard let adjustedTimestamp = agg.pkt.timestamp.adding(delta)
       else {
-        state = .idle(prevLoss: 0, lossSinceMark: false)
+        failPacket(agg)
         return .failure(
           makeError(
             agg.pkt,
@@ -277,7 +352,7 @@ struct AACDepacketizer: Sendable {
         ctx: agg.pkt.ctx,
         streamId: agg.pkt.streamId,
         timestamp: adjustedTimestamp,
-        frameLength: UInt32(config.frameLength),
+        frameLength: ticksPerAU,
         loss: agg.loss,
         data: frameData
       )

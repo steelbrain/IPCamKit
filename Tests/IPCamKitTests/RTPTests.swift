@@ -211,6 +211,18 @@ struct TimelineTests {
     #expect(NtpTimestamp(rawValue: epochRaw).date == Date(timeIntervalSince1970: 0))
     // A normal post-1970 value (1 second after epoch) is unchanged.
     #expect(NtpTimestamp(rawValue: epochRaw + (1 << 32)).date == Date(timeIntervalSince1970: 1))
+    // 1969 (top bit set, before the Unix epoch) still clamps.
+    #expect(
+      NtpTimestamp(rawValue: epochRaw - (86_400 << 32)).date == Date(timeIntervalSince1970: 0))
+  }
+
+  @Test("NTP seconds with the top bit clear are after the 2036 rollover (RFC 4330 era 1)")
+  func ntpEraOne() {
+    // One hour after 2036-02-07T06:28:16Z, when the 32-bit seconds field wraps.
+    let wrap: TimeInterval = 4_294_967_296 - 2_208_988_800
+    #expect(NtpTimestamp(rawValue: 3600 << 32).date == Date(timeIntervalSince1970: wrap + 3600))
+    let lastEraZero = NtpTimestamp(rawValue: 0xFFFF_FFFF << 32).date
+    #expect(lastEraZero == Date(timeIntervalSince1970: wrap - 1))
   }
 }
 
@@ -520,5 +532,225 @@ private final class DiagnosticBox: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return _events
+  }
+}
+
+@Suite("Seek start mapping")
+struct SeekStartMappingTests {
+  private func packet(
+    _ parser: inout InorderParser, sequence: UInt16, timestamp: UInt32
+  ) throws -> ReceivedRTPPacket {
+    let data = makeRTP(
+      sequence: sequence, timestamp: timestamp, ssrc: 9, payloadType: 96, marker: true,
+      payload: Data(count: 4))
+    return try #require(
+      try parser.rtp(data: data, ctx: .dummy, streamId: 0, streamCtx: .dummy))
+  }
+
+  /// 30,000 s at 90 kHz is 2.7e9 ticks, past a 32-bit RTP timestamp step.
+  @Test(
+    "After a seek a stream's first packet goes to the common start, even hours ahead",
+    arguments: [7.5, 30_000])
+  func farTarget(_ target: Double) throws {
+    // A stream that sent nothing before the seek.
+    var silent = InorderParser(
+      ssrc: nil, nextSeq: nil, isTcp: true, timeline: try Timeline(start: nil, clockRate: 90_000))
+    silent.restartSequenceTracking(continuingAt: target)
+    let first = try packet(&silent, sequence: 1, timestamp: 5)
+    #expect(abs(first.timestamp.elapsedSeconds - target) < 0.001)
+    let next = try packet(&silent, sequence: 2, timestamp: 3005)
+    #expect(abs(next.timestamp.elapsedSeconds - target - 3000.0 / 90_000) < 0.001)
+
+    // A stream that sent one packet, then nothing.
+    var quiet = InorderParser(
+      ssrc: nil, nextSeq: nil, isTcp: true, timeline: try Timeline(start: nil, clockRate: 90_000))
+    _ = try packet(&quiet, sequence: 1, timestamp: 5)
+    quiet.restartSequenceTracking(continuingAt: target)
+    let resumed = try packet(&quiet, sequence: 700, timestamp: 123_456)
+    #expect(abs(resumed.timestamp.elapsedSeconds - target) < 0.001)
+
+    // RTP-Info mapping a stream's `rtptime` there.
+    var mapped = InorderParser(
+      ssrc: nil, nextSeq: nil, isTcp: true, timeline: try Timeline(start: nil, clockRate: 90_000))
+    _ = try packet(&mapped, sequence: 1, timestamp: 5)
+    mapped.restartSequenceTracking(continuingAt: nil)
+    let applied = mapped.applySeekRTPInfo(seq: 50, rtptime: 777, ssrc: nil, elapsedSeconds: target)
+    #expect(applied)
+    let fromInfo = try packet(&mapped, sequence: 50, timestamp: 777)
+    #expect(abs(fromInfo.timestamp.elapsedSeconds - target) < 0.001)
+  }
+
+  /// A metadata stream sending one document every 5 s mustn't push the common
+  /// start 3 s past the video; B-frames (sent in decoding order) mustn't put
+  /// it at a timestamp already delivered.
+  @Test("The seek start follows the highest timestamp, one capped step on")
+  func nextAfterHighest() throws {
+    var video = try Timeline(start: 0, clockRate: 90_000)
+    for index in 0..<300 { _ = try video.advanceTo(UInt32(index * 3600)) }  // 25 fps, 11.96 s
+    var metadata = try Timeline(start: 0, clockRate: 90_000)
+    for seconds in [0, 5, 10] { _ = try metadata.advanceTo(UInt32(seconds * 90_000)) }
+    let videoNext = try #require(video.nextElapsedSeconds)
+    let metadataNext = try #require(metadata.nextElapsedSeconds)
+    #expect(abs(videoNext - 12.0) < 0.001)
+    #expect(abs(metadataNext - 10.5) < 0.001)
+    #expect(max(videoNext, metadataNext) < 12.1)
+
+    // I0 P3 B1 B2, 3000 ticks a frame.
+    var bFrames = try Timeline(start: 0, clockRate: 90_000)
+    for ticks in [0, 9000, 3000, 6000] { _ = try bFrames.advanceTo(UInt32(ticks)) }
+    let next = try #require(bFrames.nextElapsedSeconds)
+    #expect(next > 9000.0 / 90_000)
+    var continued = bFrames
+    continued.rebase(continuingWith: 777)
+    #expect(try continued.advanceTo(777).elapsedSeconds > 9000.0 / 90_000)
+
+    // I0 P3 B1 B2 P6 B4: the last forward step (B2 to P6) is 4 frames, the
+    // frame interval 1, so the next frame is at 7.
+    var reordered = try Timeline(start: 0, clockRate: 90_000)
+    for frame in [0, 3, 1, 2, 6, 4] { _ = try reordered.advanceTo(UInt32(frame * 3000)) }
+    let reorderedNext = try #require(reordered.nextElapsedSeconds)
+    #expect(abs(reorderedNext - 7.0 * 3000 / 90_000) < 0.0001)
+
+    // A single timestamp (one keyframe, sent as several packets) gives no
+    // interval: the next frame is still after it, one tick on.
+    var single = try Timeline(start: 0, clockRate: 90_000)
+    for _ in 0..<3 { _ = try single.advanceTo(4500) }
+    let singleNext = try #require(single.nextElapsedSeconds)
+    #expect(singleNext > 4500.0 / 90_000)
+    #expect(singleNext < 4502.0 / 90_000)
+  }
+}
+
+/// Audio frames last past their own timestamp, and an aggregated AAC packet's
+/// access units are timestamped past the packet's: a new source, a clock
+/// restart or a seek must continue after the end of the last frame delivered.
+@Suite("Audio continuity across a timeline rebase")
+struct AudioRebaseContinuityTests {
+  /// An in-order parser and audio depacketizer wired as the session wires
+  /// them: the end of every frame delivered is noted on the timeline.
+  private struct Receiver {
+    var parser: InorderParser
+    var depacketizer: AudioDepacketizer
+    let channels: UInt16?
+    var frames: [AudioFrame] = []
+
+    init(encodingName: String, clockRate: UInt32, channels: UInt16?, fmtp: String?) throws {
+      parser = InorderParser(
+        ssrc: nil, nextSeq: nil, isTcp: true,
+        timeline: try Timeline(start: nil, clockRate: clockRate))
+      depacketizer = try AudioDepacketizer.create(
+        encodingName: encodingName, clockRate: clockRate, channels: channels,
+        formatSpecificParams: fmtp)
+      self.channels = channels
+    }
+
+    mutating func send(seq: UInt16, ts: UInt32, ssrc: UInt32, payload: Data) throws {
+      let data = makeRTP(
+        sequence: seq, timestamp: ts, ssrc: ssrc, payloadType: 96, marker: true, payload: payload)
+      guard let pkt = try parser.rtp(data: data, ctx: .dummy, streamId: 0, streamCtx: .dummy)
+      else { return }
+      try depacketizer.push(pkt)
+      while let result = depacketizer.pull() {
+        guard case .success(.audioFrame(let frame)) = result else { continue }
+        parser.timeline.noteFrameEnd(
+          frame.timestamp.timestamp + Int64(depacketizer.ticks(of: frame, channels: channels)))
+        frames.append(frame)
+      }
+    }
+  }
+
+  /// AAC-LC at 48 kHz (1024 ticks an access unit), AAC-hbr.
+  private static let aacFmtp =
+    "streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;"
+    + "config=1190"
+
+  /// An AAC-hbr payload carrying `count` access units of 4 bytes.
+  private static func aacPayload(_ count: Int) -> Data {
+    var payload = Data([0, UInt8(count * 16)])
+    for _ in 0..<count { payload.append(contentsOf: [0, 4 << 3]) }
+    payload.append(Data(repeating: 0x21, count: 4 * count))
+    return payload
+  }
+
+  enum Change: String, CaseIterable, CustomTestStringConvertible {
+    case ssrc, clockRestart, seek
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "Aggregated AAC continues after the last access unit delivered",
+    .timeLimit(.minutes(1)), arguments: Change.allCases)
+  func aacAggregated(_ change: Change) throws {
+    var receiver = try Receiver(
+      encodingName: "mpeg4-generic", clockRate: 48_000, channels: 2, fmtp: Self.aacFmtp)
+    let expected: [Int64]
+    switch change {
+    case .ssrc:
+      try receiver.send(seq: 10, ts: 1_000_000, ssrc: 1, payload: Self.aacPayload(4))
+      try receiver.send(seq: 11, ts: 1_004_096, ssrc: 1, payload: Self.aacPayload(4))
+      // The first packet of the new SSRC is dropped; the second confirms it.
+      try receiver.send(seq: 500, ts: 9_000_000, ssrc: 2, payload: Self.aacPayload(4))
+      try receiver.send(seq: 501, ts: 9_004_096, ssrc: 2, payload: Self.aacPayload(4))
+      expected = (0..<12).map { Int64($0) * 1024 }
+    case .clockRestart:
+      try receiver.send(seq: 10, ts: 1_000_000, ssrc: 1, payload: Self.aacPayload(4))
+      try receiver.send(seq: 11, ts: 1_004_096, ssrc: 1, payload: Self.aacPayload(4))
+      // More than 5 s behind: the sender's RTP clock restarted.
+      try receiver.send(seq: 12, ts: 1_000, ssrc: 1, payload: Self.aacPayload(4))
+      expected = (0..<12).map { Int64($0) * 1024 }
+    case .seek:
+      // One access unit, then four: the smallest packet gap (1024) is less
+      // than the last packet's four access units.
+      try receiver.send(seq: 10, ts: 1_000_000, ssrc: 1, payload: Self.aacPayload(1))
+      try receiver.send(seq: 11, ts: 1_001_024, ssrc: 1, payload: Self.aacPayload(4))
+      let next = try #require(receiver.parser.nextElapsedSeconds)
+      #expect(next == 5120.0 / 48_000)
+      receiver.parser.restartSequenceTracking(continuingAt: next)
+      receiver.depacketizer = try AudioDepacketizer.create(
+        encodingName: "mpeg4-generic", clockRate: 48_000, channels: 2,
+        formatSpecificParams: Self.aacFmtp)
+      try receiver.send(seq: 9000, ts: 77_777, ssrc: 3, payload: Self.aacPayload(4))
+      expected = (0..<9).map { Int64($0) * 1024 }
+    }
+    #expect(receiver.frames.map(\.timestamp.elapsed) == expected)
+  }
+
+  @Test(
+    "Sample-based audio from a new SSRC starts where the last frame ended",
+    .timeLimit(.minutes(1)),
+    arguments: [
+      ("pcmu", nil, 160),
+      // 160 ticks of 2 channels of 2 bytes: `frameLength` counts 320 samples.
+      ("l16", 2, 640),
+    ] as [(String, UInt16?, Int)])
+  func sampleBasedSSRC(encodingName: String, channels: UInt16?, bytes: Int) throws {
+    var receiver = try Receiver(
+      encodingName: encodingName, clockRate: 8000, channels: channels, fmtp: nil)
+    let payload = Data(repeating: 0x7F, count: bytes)
+    try receiver.send(seq: 10, ts: 1000, ssrc: 1, payload: payload)
+    try receiver.send(seq: 11, ts: 1160, ssrc: 1, payload: payload)
+    try receiver.send(seq: 500, ts: 50_000, ssrc: 2, payload: payload)
+    try receiver.send(seq: 501, ts: 50_160, ssrc: 2, payload: payload)
+    let ticks = receiver.frames.map {
+      receiver.depacketizer.ticks(of: $0, channels: channels)
+    }
+    #expect(receiver.frames.map(\.timestamp.elapsed) == [0, 160, 320])
+    #expect(ticks == [160, 160, 160])
+  }
+
+  @Test("A seek mapping behind the end of the last frame is refused", .timeLimit(.minutes(1)))
+  func mappingBehindFrameEnd() throws {
+    var timeline = try Timeline(start: 0, clockRate: 48_000)
+    _ = try timeline.advanceTo(0)
+    _ = try timeline.advanceTo(1024)
+    timeline.noteFrameEnd(5120)
+    timeline.noteFrameEnd(2048)  // An earlier end doesn't move it back.
+    #expect(timeline.nextElapsedSeconds == 5120.0 / 48_000)
+    let behind = timeline.rebase(mapping: 9, toElapsedSeconds: 3000.0 / 48_000)
+    #expect(!behind)
+    let atEnd = timeline.rebase(mapping: 9, toElapsedSeconds: 5120.0 / 48_000)
+    #expect(atEnd)
+    let first = try timeline.advanceTo(9)
+    #expect(first.elapsed == 5120)
   }
 }

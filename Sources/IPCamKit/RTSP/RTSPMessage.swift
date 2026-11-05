@@ -25,6 +25,10 @@ public struct RTSPRequest: Sendable {
   public var version: String
   public var headers: [(String, String)]
   public var body: Data
+  /// Lowercased names of the headers whose values `RTSPSerializer` writes as
+  /// ISO Latin-1 bytes instead of UTF-8. Set by `setHeader(_:value:)` with a
+  /// Latin-1 `RTSPHeaderValue`, cleared by setting the header to a `String`.
+  var latin1HeaderNames: Set<String> = []
 
   public init(
     method: RTSPMethod,
@@ -48,6 +52,11 @@ public struct RTSPResponse: Sendable {
   public var version: String
   public var headers: [(String, String)]
   public var body: Data
+  /// Indices into `headers` of the values the parser decoded as ISO Latin-1
+  /// because their bytes were not valid UTF-8. `headerValues(named:)` reports
+  /// them, so a value that is hashed or echoed (a Digest `realm`) can be turned
+  /// back into the bytes the server sent.
+  var latin1HeaderIndices: Set<Int> = []
 
   public init(
     statusCode: UInt16,
@@ -64,6 +73,51 @@ public struct RTSPResponse: Sendable {
   }
 }
 
+/// A header value together with the charset that maps it back to bytes.
+///
+/// The parser decodes a header value as UTF-8, or as ISO Latin-1 when its
+/// bytes are not valid UTF-8 (a camera sending GBK or Shift-JIS). Latin-1 maps
+/// each byte to the scalar of the same number, so `bytes` of a Latin-1 value is
+/// exactly what the server sent.
+struct RTSPHeaderValue: Sendable, Equatable {
+  var text: String
+  /// `text` stands for its ISO Latin-1 encoding (every scalar is at most
+  /// U+00FF) rather than its UTF-8 encoding.
+  var isLatin1: Bool
+
+  init(_ text: String, isLatin1: Bool = false) {
+    self.text = text
+    self.isLatin1 = isLatin1
+  }
+
+  /// The bytes `text` stands for: one byte per scalar when `isLatin1`, else
+  /// UTF-8. A Latin-1 value holding a scalar above U+00FF (never produced by the
+  /// parser) falls back to UTF-8.
+  var bytes: Data {
+    if isLatin1, let bytes = Self.latin1Bytes(text) { return bytes }
+    return Data(text.utf8)
+  }
+
+  /// `bytes` decoded as ISO Latin-1: each byte becomes the scalar U+0000 to
+  /// U+00FF with the same number.
+  static func latin1Text<Bytes: Sequence>(_ bytes: Bytes) -> String where Bytes.Element == UInt8 {
+    var scalars = String.UnicodeScalarView()
+    scalars.append(contentsOf: bytes.lazy.map { Unicode.Scalar($0) })
+    return String(scalars)
+  }
+
+  /// `text` encoded as ISO Latin-1, or nil if a scalar is above U+00FF.
+  static func latin1Bytes(_ text: String) -> Data? {
+    var bytes = Data()
+    bytes.reserveCapacity(text.unicodeScalars.count)
+    for scalar in text.unicodeScalars {
+      guard scalar.value <= 0xFF else { return nil }
+      bytes.append(UInt8(scalar.value))
+    }
+    return bytes
+  }
+}
+
 /// RTSP interleaved data (RTP/RTCP over TCP).
 /// Format: '$' + 1-byte channel + 2-byte big-endian length + data
 public struct RTSPInterleavedData: Sendable {
@@ -77,7 +131,8 @@ public struct RTSPInterleavedData: Sendable {
 }
 
 /// A received RTSP message: either a response or interleaved data.
-/// Requests are sent, not received, in client mode.
+/// Requests a server sends to the client (RFC 2326 §10, e.g. an `OPTIONS`
+/// keepalive) are not represented here; `RTSPParser.parse(_:)` skips them.
 public enum RTSPMessage: Sendable {
   case response(RTSPResponse)
   case data(RTSPInterleavedData)
@@ -96,6 +151,20 @@ extension RTSPResponse {
   public func headers(named name: String) -> [String] {
     let lowered = name.lowercased()
     return headers.filter { $0.0.lowercased() == lowered }.map(\.1)
+  }
+
+  /// `headers(named:)`, with each value marked as ISO Latin-1 when the parser
+  /// decoded it that way (see `RTSPHeaderValue`).
+  func headerValues(named name: String) -> [RTSPHeaderValue] {
+    let lowered = name.lowercased()
+    return headers.indices.compactMap { index -> RTSPHeaderValue? in
+      let (headerName, value) = headers[index]
+      guard headerName.lowercased() == lowered else { return nil }
+      let isLatin1 =
+        latin1HeaderIndices.contains(index)
+        && value.unicodeScalars.allSatisfy { $0.value <= 0xFF }
+      return RTSPHeaderValue(value, isLatin1: isLatin1)
+    }
   }
 
   /// Parses the CSeq header value, trimming whitespace.
@@ -126,10 +195,19 @@ extension RTSPRequest {
   /// Sets or replaces a header (case-insensitive match for replacement).
   public mutating func setHeader(_ name: String, value: String) {
     let lowered = name.lowercased()
+    latin1HeaderNames.remove(lowered)
     if let idx = headers.firstIndex(where: { $0.0.lowercased() == lowered }) {
       headers[idx] = (name, value)
     } else {
       headers.append((name, value))
     }
+  }
+
+  /// Sets or replaces a header whose value may stand for ISO Latin-1 bytes
+  /// (an `Authorization` answering a challenge the parser decoded as Latin-1):
+  /// the serializer then writes those bytes rather than the UTF-8 encoding.
+  mutating func setHeader(_ name: String, value: RTSPHeaderValue) {
+    setHeader(name, value: value.text)
+    if value.isLatin1 { latin1HeaderNames.insert(name.lowercased()) }
   }
 }

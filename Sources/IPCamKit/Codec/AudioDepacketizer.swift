@@ -33,7 +33,12 @@ enum AudioDepacketizer: Sendable {
     case "g726-24":
       return .simpleAudio(
         SimpleAudioDepacketizer(clockRate: clockRate, bitsPerSample: 3))
-    case "dvi4", "g726-32":
+    case "dvi4":
+      // Each packet starts with a 4-byte state header (RFC 3551 section
+      // 4.5.1), which holds no samples.
+      return .simpleAudio(
+        SimpleAudioDepacketizer(clockRate: clockRate, bitsPerSample: 4, headerBytes: 4))
+    case "g726-32":
       return .simpleAudio(
         SimpleAudioDepacketizer(clockRate: clockRate, bitsPerSample: 4))
     case "g726-40":
@@ -53,22 +58,26 @@ enum AudioDepacketizer: Sendable {
     }
   }
 
+  /// Pushes `pkt` to the codec depacketizer. The codec's state is written back
+  /// even when its `push` throws: a depacketizer resets (and carries loss
+  /// forward) before throwing, and that reset must not be lost. `self` is
+  /// consumed so the payload's buffers are changed in place, not copied.
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
-    switch self {
+    switch consume self {
     case .aac(var d):
+      defer { self = .aac(d) }
       try d.push(pkt)
-      self = .aac(d)
     case .simpleAudio(var d):
+      defer { self = .simpleAudio(d) }
       try d.push(pkt)
-      self = .simpleAudio(d)
     case .g723(var d):
+      defer { self = .g723(d) }
       try d.push(pkt)
-      self = .g723(d)
     }
   }
 
   mutating func pull() -> Result<CodecItem, DepacketizeError>? {
-    switch self {
+    switch consume self {
     case .aac(var d):
       let item = d.pull()
       self = .aac(d)
@@ -86,6 +95,16 @@ enum AudioDepacketizer: Sendable {
 }
 
 extension AudioDepacketizer {
+  /// RTP clock ticks `frame` lasts on a stream of `channels` channels (nil
+  /// for one). One tick holds one sample of each channel, but a sample-based
+  /// codec's `frameLength` counts the samples of all channels; AAC and G.723
+  /// frame lengths are ticks already.
+  func ticks(of frame: AudioFrame, channels: UInt16?) -> UInt32 {
+    guard case .simpleAudio = self, let channels, channels > 1 else { return frame.frameLength }
+    // Rounded up, so a payload cut mid-tick still ends after its last sample.
+    return (frame.frameLength + UInt32(channels) - 1) / UInt32(channels)
+  }
+
   var audioParameters: AudioParameters? {
     switch self {
     case .aac(let d): return d.parameters

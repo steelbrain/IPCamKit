@@ -7,7 +7,7 @@ import Foundation
 /// A depacketized metadata frame from an RTSP `application` stream.
 ///
 /// Per the ONVIF Streaming Specification, the payload is an XML document with
-/// root node `tt:MetaDataStream`, optionally GZIP-compressed; the RTP marker
+/// root node `tt:MetadataStream`, optionally GZIP-compressed; the RTP marker
 /// bit signals end-of-document.
 struct MetadataFrame: Sendable, Equatable {
   /// Context of the last packet in this frame.

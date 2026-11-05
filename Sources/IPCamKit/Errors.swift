@@ -14,7 +14,8 @@ public enum RTSPError: Error, Sendable, CustomStringConvertible {
   case timeout
   case invalidSDP(String)
   case depacketizationError(String)
-  /// A library API was used incorrectly (e.g. `frames()` consumed more than once).
+  /// A library API was used incorrectly (e.g. a second `frames()` sequence
+  /// iterated while another is still in use).
   case invalidState(String)
 
   public var description: String {
@@ -39,4 +40,10 @@ public enum RTSPError: Error, Sendable, CustomStringConvertible {
       return "Invalid state: \(msg)"
     }
   }
+}
+
+/// Bridges `description` to `localizedDescription`, which otherwise falls back
+/// to Foundation's generic "The operation couldn't be completed" text.
+extension RTSPError: LocalizedError {
+  public var errorDescription: String? { description }
 }

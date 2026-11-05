@@ -192,11 +192,12 @@ struct H265DepacketizerTests {
         payload: Data([0x62, 0x01, 0x94]) + Data("fu start, ".utf8)))
     #expect(d.pull() == nil)
 
-    // Different timestamp — single NAL PREFIX_SEI with mark
+    // Different timestamp — single NAL TRAIL_R with mark. (Upstream uses a
+    // PREFIX_SEI, but a prefix SEI cannot end an access unit.)
     try d.push(
       makeH265Packet(
         seq: 0, timestamp: h265Ts1, mark: true,
-        payload: Data([0x4e, 0x01]) + Data("plain".utf8)))
+        payload: Data([0x02, 0x01]) + Data("plain".utf8)))
 
     // First pull: error about timestamp change mid-fragment
     guard case .failure(let err) = d.pull() else {
@@ -212,8 +213,10 @@ struct H265DepacketizerTests {
       Issue.record("Expected recovered frame")
       return
     }
-    let expected: [UInt8] = [0x00, 0x00, 0x00, 0x07, 0x4e, 0x01] + Array("plain".utf8)
+    let expected: [UInt8] = [0x00, 0x00, 0x00, 0x07, 0x02, 0x01] + Array("plain".utf8)
     assertDataEqual(f.data, expected)
+    // The dropped fragment is reported as loss on the recovered frame.
+    #expect(f.loss == 1)
     #expect(d.pull() == nil)
   }
 

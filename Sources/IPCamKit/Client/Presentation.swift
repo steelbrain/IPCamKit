@@ -18,11 +18,20 @@ public struct Presentation: Sendable {
   /// Server tool string (from SDP `a=tool:` attribute).
   public var tool: String?
 
-  public init(streams: [Stream], baseURL: String, control: String, tool: String? = nil) {
+  /// Session-level SDP `a=range:` value (e.g. `clock=20250101T000000Z-` for an
+  /// ONVIF recording), or, when the session has none, that of the first media
+  /// section that parses and has one.
+  public var range: String?
+
+  public init(
+    streams: [Stream], baseURL: String, control: String, tool: String? = nil,
+    range: String? = nil
+  ) {
     self.streams = streams
     self.baseURL = baseURL
     self.control = control
     self.tool = tool
+    self.range = range
   }
 }
 
@@ -52,6 +61,15 @@ public struct Stream: Sendable {
   /// Format-specific parameters from SDP `a=fmtp:` attribute
   public let formatSpecificParams: String?
 
+  /// Media direction (`a=sendonly` / `recvonly` / `sendrecv` / `inactive`),
+  /// inherited from the session level when the media has none. In an ONVIF
+  /// backchannel SDP, `.sendOnly` marks the stream the client sends.
+  public var direction: MediaDirection?
+
+  /// SDP `a=key-mgmt:` value (`mikey <base64>`), the SRTP keys an RTSPS server
+  /// offers for this stream; inherited from the session level.
+  var keyMgmt: String?
+
   /// Stream state for SETUP/PLAY tracking
   var state: StreamState = .uninit
 
@@ -77,7 +95,8 @@ public struct Stream: Sendable {
     channels: UInt16? = nil,
     framerate: Float? = nil,
     control: String? = nil,
-    formatSpecificParams: String? = nil
+    formatSpecificParams: String? = nil,
+    direction: MediaDirection? = nil
   ) {
     self.media = media
     self.encodingName = encodingName
@@ -87,6 +106,7 @@ public struct Stream: Sendable {
     self.framerate = framerate
     self.control = control
     self.formatSpecificParams = formatSpecificParams
+    self.direction = direction
   }
 }
 
@@ -112,6 +132,12 @@ public struct SetupResponse: Sendable {
   public var channelId: UInt8?
   public var source: String?
   public var serverPort: UInt16?
+  /// Multicast group address (`destination=`) for a multicast SETUP.
+  public var destination: String?
+  /// Multicast RTP port (`port=P-P+1`); RTCP is one higher.
+  public var multicastPort: UInt16?
+  /// Multicast time-to-live (`ttl=`).
+  public var ttl: UInt8?
 }
 
 /// Parsed Session header from SETUP response.

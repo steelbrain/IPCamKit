@@ -189,8 +189,13 @@ func parseSPS(_ spsNAL: Data) throws -> ParsedSPS {
     _ = reader.readSignedExpGolomb()  // offset_for_non_ref_pic
     _ = reader.readSignedExpGolomb()  // offset_for_top_to_bottom_field
     if let numRefFrames = reader.readExpGolomb() {
-      // numRefFrames is attacker-controlled; stop as soon as the bitstream
-      // runs out so a bogus count can't spin billions of iterations.
+      // num_ref_frames_in_pic_order_cnt_cycle is in [0, 255] (H.264 7.4.2.1.1).
+      // Reject larger values so a bogus count can't drive the loop below over
+      // a large SPS; the loop also stops as soon as the bitstream runs out.
+      guard numRefFrames <= 255 else {
+        throw RTSPError.depacketizationError(
+          "SPS: num_ref_frames_in_pic_order_cnt_cycle \(numRefFrames) must be in [0, 255]")
+      }
       for _ in 0..<numRefFrames {
         guard reader.readSignedExpGolomb() != nil else { break }
       }
