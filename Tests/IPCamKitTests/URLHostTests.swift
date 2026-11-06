@@ -8,6 +8,44 @@ import Testing
 
 @testable import IPCamKit
 
+/// SplitMix64, so generated inputs repeat from run to run.
+private struct SeededGenerator: RandomNumberGenerator {
+  var state: UInt64
+  mutating func next() -> UInt64 {
+    state &+= 0x9E37_79B9_7F4A_7C15
+    var z = state
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+  }
+}
+
+/// Up to 12 characters of a URL part, as written and as meant: a character
+/// in `raw` is written raw or percent-encoded, any other always encoded, and
+/// a `%` that no hex digits follow (`%g`) means itself.
+private func generatedPart(
+  _ rng: inout SeededGenerator, raw: String
+) -> (written: String, meant: String) {
+  let characters = Array(raw + "%/?#@: \u{7F}")
+  var written = ""
+  var meant = ""
+  for _ in 0..<Int.random(in: 0...12, using: &rng) {
+    let character = characters.randomElement(using: &rng)!
+    if character == "%" && Bool.random(using: &rng) {
+      written += "%g"
+      meant += "%g"
+      continue
+    }
+    if raw.contains(character) && Bool.random(using: &rng) {
+      written.append(character)
+    } else {
+      written += String(character).utf8.map { String(format: "%%%02X", $0) }.joined()
+    }
+    meant.append(character)
+  }
+  return (written, meant)
+}
+
 @Suite("URL host parsing")
 struct URLHostTests {
 
@@ -140,6 +178,23 @@ struct URLHostTests {
       ("rtsp://cam.example:554/live@\u{301}main", true),
       // An IPv6 literal with a port can't be read as a password's start.
       ("rtsp://[::1]:8554/a@b", false),
+      // Nor can an IPv4 address with one: ONVIF cameras report stream URIs
+      // with a password in the query.
+      ("rtsp://192.0.2.5:554/live?password=Adm1n@2024", false),
+      ("rtsp://192.0.2.5/live?password=Adm1n@2024", false),
+      ("rtsp://[fd00::5]:554/live?password=Adm1n@2024", false),
+      ("rtsp://10.0.0.1:8554/a/b@c", false),
+      // A name with a port could be a user name with a password.
+      ("rtsp://cam.example:554/live?password=Adm1n@2024", true),
+      ("rtsp://localhost:8554/a/b@c", true),
+      // So could anything that isn't four decimal octets and a port.
+      ("rtsp://192.0.2:554/live?password=Adm1n@2024", true),
+      ("rtsp://192.0.2.256:554/live?password=Adm1n@2024", true),
+      ("rtsp://0x7f.0.0.1:554/live?password=Adm1n@2024", true),
+      ("rtsp://192.0.2.5:/live?password=Adm1n@2024", true),
+      ("rtsp://192.0.2.5:55a/live?password=Adm1n@2024", true),
+      ("rtsp://192.0.2.5:554:1/live?password=Adm1n@2024", true),
+      ("rtsp://192.0.2.5:554/live?start=10:00&password=Adm1n@2024", true),
       ("rtsp://admin:12?3@192.168.1.10/stream", true),
       ("rtsp://admin:12#3@192.168.1.10/stream", true),
       ("rtsp://admin:12%2F3@192.168.1.10/stream", false),
@@ -280,22 +335,231 @@ struct URLHostTests {
     await session.stop()
   }
 
-  /// `user` 127.0.0.1, password `<port>/abc`: Foundation reads the URL as
-  /// host 127.0.0.1 and that port, which is the fake server's.
+  /// `user` localhost, password `<port>/abc`: Foundation reads the URL as
+  /// host localhost and that port, which is the fake server's.
   @Test("A password with a raw / isn't sent to the host named by the user name")
   func rawSlashPasswordNotSent() async throws {
     let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
     try await server.start()
     defer { server.stop() }
-    let session = RTSPClientSession(url: "rtsp://127.0.0.1:\(server.port)/abc@cam.invalid/stream")
+    let session = RTSPClientSession(url: "rtsp://localhost:\(server.port)/abc@cam.invalid/stream")
     do {
       _ = try await session.start()
       Issue.record("start() succeeded")
-    } catch RTSPError.connectionFailed(let message) {
+    } catch RTSPError.invalidURL(let message) {
       #expect(message.contains("%2F"), "\(message)")
       #expect(!message.contains("abc"), "\(message)")
     }
     #expect(server.requests(method: "OPTIONS").isEmpty)
     await session.stop()
+  }
+
+  // MARK: Escapes next to a character URLComponents encodes
+
+  /// `URLComponents(string:)` percent-encodes a component holding a character
+  /// it can't take raw, and with it the `%` of every escape already there,
+  /// so those escapes came back undecoded (`%C2%A3ecret|1`).
+  @Test(
+    "A user name or password next to a character URLComponents encodes is decoded once",
+    arguments: [
+      ("rtsp://admin:£ecret|1@192.168.1.10/live", "admin", "£ecret|1"),
+      ("rtsp://admin:Grüße^1@192.168.1.10/live", "admin", "Grüße^1"),
+      ("rtsp://admin:§pass{1}@192.168.1.10/live", "admin", "§pass{1}"),
+      ("rtsp://admin:100%Grün@192.168.1.10/live", "admin", "100%Grün"),
+      ("rtsp://admin:P|ss%40word@192.168.1.10/live", "admin", "P|ss@word"),
+      ("rtsp://admin:p@ss%21@192.168.1.10/live", "admin", "p@ss!"),
+      ("rtsp://admin:pa:ss%21@192.168.1.10/live", "admin", "pa:ss!"),
+      ("rtsp://admin:Grüße%2F1@192.168.1.10/live", "admin", "Grüße/1"),
+      ("rtsp://admin:Pass%40word@192.168.1.10/live", "admin", "Pass@word"),
+      (#"rtsp://admin:a"<>[\]^`{|}%25@192.168.1.10/live"#, "admin", #"a"<>[\]^`{|}%"#),
+      ("rtsp://ad|m%69n@site:pw%21@[fe80::1%25lo0]:554/live", "ad|min@site", "pw!"),
+      ("rtsp://j%C3%BCrgen:pässw%40rd@cam/x", "jürgen", "pässw@rd"),
+      ("rtsp://%7Bu%7D|:@cam/x", "{u}|", ""),
+      // URLComponents.user and .password drop a leading U+FEFF.
+      ("rtsp://%EF%BB%BFadmin:%EF%BB%BFx@cam/x", "\u{FEFF}admin", "\u{FEFF}x"),
+      ("rtsp://admin:\u{FEFF}pass|@cam/x", "admin", "\u{FEFF}pass|"),
+    ])
+  func userInfoDecodedOnce(_ url: String, _ user: String, _ password: String) throws {
+    let split = try splitUserInfo(url)
+    #expect(split.credentials?.username == user)
+    #expect(split.credentials?.password == password)
+    #expect(!split.url.contains(user) && !split.url.contains("@"), "\(split.url)")
+  }
+
+  @Test(
+    "A user name or password that isn't percent-encoded UTF-8 is refused, whatever is next to it",
+    arguments: [
+      "rtsp://admin:pw%FF@192.168.1.10/live", "rtsp://admin:pw%E9|@192.168.1.10/live",
+      "rtsp://admin:é%E9|@192.168.1.10/live", "rtsp://ad%E9{:pw@192.168.1.10/live",
+    ])
+  func userInfoNotUTF8(_ url: String) {
+    #expect(throws: RTSPError.self) { try splitUserInfo(url) }
+  }
+
+  /// The URL `start()` puts on the request line: escapes in the path and
+  /// query as written, whether or not the URL has a login or a Unicode host.
+  @Test(
+    "Path and query escapes reach the request line as written",
+    arguments: [
+      ("rtsp://192.168.1.10/live/a{%20b", "rtsp://192.168.1.10/live/a{%20b"),
+      ("rtsp://admin:pw@192.168.1.10/live/a{%20b", "rtsp://192.168.1.10/live/a{%20b"),
+      ("rtsp://admin:pw@192.168.1.10/live?name=a|%26b", "rtsp://192.168.1.10/live?name=a|%26b"),
+      ("rtsp://café.local/live/a{%20b", "rtsp://xn--caf-dma.local/live/a{%20b"),
+      ("rtsp://caf%C3%A9.local/live/a{%20b", "rtsp://xn--caf-dma.local/live/a{%20b"),
+      ("rtsp://café.local/live/a?q=x|%2Fy", "rtsp://xn--caf-dma.local/live/a?q=x|%2Fy"),
+      (
+        "rtsp://u:p|1@café.local:8554/é{%20}?q=ü|%26#f|%41",
+        "rtsp://xn--caf-dma.local:8554/%C3%A9{%20}?q=%C3%BC|%26"
+      ),
+      ("rtsp://admin:pw@192.168.1.10/live#a{%20b", "rtsp://192.168.1.10/live"),
+      ("rtsp://u:p@[fe80::1%25lo0]:554/a[1]%5B", "rtsp://[fe80::1%25lo0]:554/a[1]%5B"),
+      ("rtsp://u:p@192.168.1.10/100%/x%4", "rtsp://192.168.1.10/100%/x%4"),
+    ])
+  func requestURLKeepsEscapes(_ url: String, _ expected: String) throws {
+    #expect(withoutFragment(asciiURL(try splitUserInfo(url).url)) == expected)
+  }
+
+  @Test("start() sends the path and query as written, and the URL's login only as credentials")
+  func requestLineAsWritten() async throws {
+    var configuration = FakeRTSPServer.Configuration(sdp: h264VideoOnlySDP())
+    configuration.path = "live/a{%20b"
+    let server = FakeRTSPServer(configuration: configuration)
+    server.onRequest = { request in
+      guard request.header("Authorization") == nil else { return nil }
+      return FakeRTSPResponse(
+        statusCode: 401, headers: [("WWW-Authenticate", #"Basic realm="camera""#)])
+    }
+    try await server.start()
+    defer { server.stop() }
+    let query = "?name=a|%26b"
+    let url =
+      server.url.replacingOccurrences(of: "rtsp://", with: "rtsp://admin:£P|ss%40word@") + query
+    let session = RTSPClientSession(url: url)
+    _ = try await session.start()
+    await session.stop()
+    let describe = server.requests(method: "DESCRIBE").last
+    #expect(describe?.url == server.url + query)
+    let expected = "Basic " + Data("admin:£P|ss@word".utf8).base64EncodedString()
+    #expect(describe?.header("Authorization") == expected)
+  }
+
+  /// The URL's user name and password were decoded before the passed
+  /// credentials were chosen, so one that isn't UTF-8 failed `start()`.
+  @Test("With credentials passed, the URL's user name and password are only removed")
+  func passedCredentialsIgnoreUserInfo() async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    server.onRequest = { request in
+      guard request.header("Authorization") == nil else { return nil }
+      return FakeRTSPResponse(
+        statusCode: 401, headers: [("WWW-Authenticate", #"Basic realm="camera""#)])
+    }
+    try await server.start()
+    defer { server.stop() }
+    let url = server.url.replacingOccurrences(of: "rtsp://", with: "rtsp://admin:pw%FF@")
+    let session = RTSPClientSession(
+      url: url, credentials: Credentials(username: "viewer", password: "s3cret"))
+    _ = try await session.start()
+    await session.stop()
+    #expect(server.requests.allSatisfy { $0.url.hasPrefix(server.url) }, "\(server.requests)")
+    let expected = "Basic " + Data("viewer:s3cret".utf8).base64EncodedString()
+    #expect(server.requests(method: "DESCRIBE").last?.header("Authorization") == expected)
+  }
+
+  /// URLs put together from known parts, each character written raw (where
+  /// the part allows it) or percent-encoded, must read back as those parts.
+  @Test("Generated URLs read back as written: credentials, path, query and request URL")
+  func generatedURLsReadBack() throws {
+    var rng = SeededGenerator(state: 0x1BCA_4C17)
+    let safe = "abcXYZ019-._~!$&'()*+,;=" + #""<>[\]^`{|}"# + "é£日👍"
+    let hosts = [
+      ("192.168.1.10", "192.168.1.10"), ("cam.example", "cam.example"),
+      ("[fe80::1%25lo0]", "[fe80::1%25lo0]"), ("café.local", "xn--caf-dma.local"),
+      ("caf%C3%A9.local", "xn--caf-dma.local"),
+    ]
+    for _ in 0..<20_000 {
+      let user = generatedPart(&rng, raw: safe + "@")
+      let password = generatedPart(&rng, raw: safe + "@:")
+      let path = generatedPart(&rng, raw: safe + ":@/")
+      let query = generatedPart(&rng, raw: safe + ":@/?")
+      let fragment = generatedPart(&rng, raw: safe + ":@/?#")
+      let (host, sentHost) = hosts.randomElement(using: &rng)!
+      let port = Bool.random(using: &rng) ? ":8554" : ""
+      let hasPassword = Bool.random(using: &rng)
+      let userInfo = user.written + (hasPassword ? ":" + password.written : "") + "@"
+      let hasQuery = Bool.random(using: &rng)
+      let resource = "/" + path.written + (hasQuery ? "?" + query.written : "")
+      let rest = port + resource + (Bool.random(using: &rng) ? "#" + fragment.written : "")
+      let url = "rtsp://" + userInfo + host + rest
+
+      let components = try #require(URLComponents(string: percentEncodingForParsing(url)), "\(url)")
+      #expect(components.path == "/" + path.meant, "\(url)")
+      #expect(components.query == (hasQuery ? query.meant : nil), "\(url)")
+      let split = try splitUserInfo(url)
+      #expect(split.credentials?.username == user.meant, "\(url)")
+      #expect(split.credentials?.password == (hasPassword ? password.meant : ""), "\(url)")
+      #expect(split.url == "rtsp://" + host + rest, "\(url)")
+      let sent = percentEncodingNonASCII("rtsp://" + sentHost + port + resource)
+      #expect(withoutFragment(asciiURL(split.url)) == sent, "\(url)")
+    }
+  }
+
+  /// ONVIF cameras report stream URIs with a password in the query, on an
+  /// IPv4 address with a port.
+  @Test("An @ in the query of an IPv4 address with a port reaches the server")
+  func ipv4PortQueryAt() async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    try await server.start()
+    defer { server.stop() }
+    let url = server.url + "?user=admin&password=Adm1n@2024"
+    let session = RTSPClientSession(url: url)
+    _ = try await session.start()
+    await session.stop()
+    #expect(server.requests(method: "DESCRIBE").last?.url == url)
+  }
+
+  // MARK: Error kinds
+
+  @Test(
+    "A URL that can't be used throws RTSPError.invalidURL without connecting",
+    arguments: [
+      "http://127.0.0.1/stream", "rtsp:///stream", "rtsp://127.0.0.1:99999/stream",
+      "rtsp://127.0.0.1:0/stream", "rtsp://127.0.0.1/a b", "rtsp://admin:pw%FF@127.0.0.1/stream",
+      "rtsp://admin:pw@127.0.0.1/a@b", "rtsp://cam%2Fx.example/stream",
+    ])
+  func invalidURLError(_ url: String) async {
+    let result = await outcome { try await RTSPClientSession(url: url).start() }
+    guard case .failure(RTSPError.invalidURL(let message)) = result else {
+      Issue.record("expected RTSPError.invalidURL, got \(result)")
+      return
+    }
+    #expect(message.hasPrefix("Invalid "), "\(message)")
+    #expect(!message.contains("pw"), "\(message)")
+  }
+
+  @Test("A tunnel URL that can't be used throws RTSPError.invalidURL")
+  func invalidTunnelURLError() async throws {
+    let tunnelURL = try #require(URL(string: "ftp://127.0.0.1/tunnel"))
+    let session = RTSPClientSession(url: "rtsp://127.0.0.1/stream", tunnel: .http(tunnelURL))
+    let result = await outcome { try await session.start() }
+    guard case .failure(RTSPError.invalidURL(let message)) = result else {
+      Issue.record("expected RTSPError.invalidURL, got \(result)")
+      return
+    }
+    #expect(message.contains("Unsupported URL scheme"), "\(message)")
+  }
+
+  @Test("A refused connection carries Network's ECONNREFUSED", .timeLimit(.minutes(1)))
+  func refusedConnectionCause() async throws {
+    // Port 9 (discard) has nothing listening on macOS, and is below the
+    // ephemeral range other tests' servers bind in. A port bound without
+    // listening wouldn't do: macOS drops the connection attempts, and the
+    // connect times out (ETIMEDOUT) instead.
+    let url = "rtsp://127.0.0.1:9/stream"
+    let result = await outcome { try await RTSPClientSession(url: url).start() }
+    guard case .failure(RTSPError.connectionFailed(let message, let underlying)) = result else {
+      Issue.record("expected RTSPError.connectionFailed, got \(result)")
+      return
+    }
+    #expect(underlying == .posix(.ECONNREFUSED), "\(message)")
   }
 }

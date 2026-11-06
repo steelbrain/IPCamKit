@@ -177,11 +177,12 @@ struct RTSPSSessionTests {
     let alert = NWError.tls(errSSLPeerCertUnknown)
     let failed = WatchedConnection(NWConnection(host: "127.0.0.1", port: 9, using: .tcp))
     failed.handle(.failed(alert))
-    guard case .connectionFailed(let message)? = failed.failure else {
+    guard case .connectionFailed(let message, let underlying)? = failed.failure else {
       Issue.record("expected a recorded failure, got \(String(describing: failed.failure))")
       return
     }
     #expect(message.hasPrefix("TLS handshake failed: "), "got: \(message)")
+    #expect(isTLSError(underlying), "got: \(String(describing: underlying))")
 
     let closed = WatchedConnection(NWConnection(host: "127.0.0.1", port: 9, using: .tcp))
     closed.cancel()
@@ -445,6 +446,12 @@ private final class HoldingRelay: @unchecked Sendable {
 }
 
 /// Start `listener` on `queue` and return its port once it is ready.
+/// Whether `error` is a TLS error from Network.
+private func isTLSError(_ error: NWError?) -> Bool {
+  if case .tls? = error { return true }
+  return false
+}
+
 private func startListening(_ listener: NWListener, queue: DispatchQueue) async throws -> UInt16 {
   try await withCheckedThrowingContinuation { continuation in
     // The handler runs on the serial `queue`, so the flag needs no lock.
@@ -509,11 +516,12 @@ struct TLSFailureAfterHandshakeTests {
     let result = await outcome { try await session.start() }
     let elapsed = ContinuousClock.now - started
     #expect(elapsed < .seconds(2), "start() took \(elapsed)")
-    guard case .failure(RTSPError.connectionFailed(let message)) = result else {
+    guard case .failure(RTSPError.connectionFailed(let message, let underlying)) = result else {
       Issue.record("expected connectionFailed, got \(result)")
       return
     }
     #expect(message.hasPrefix("TLS handshake failed: "), "got: \(message)")
+    #expect(isTLSError(underlying), "got: \(String(describing: underlying))")
     #expect(message.contains("OSStatus"), "got: \(message)")
   }
   @Test(
@@ -543,11 +551,12 @@ struct TLSFailureAfterHandshakeTests {
     closer.cancel()
     let elapsed = ContinuousClock.now - started
     #expect(elapsed < .seconds(2), "the send ended after \(elapsed)")
-    guard case .failure(RTSPError.connectionFailed(let message)) = result else {
+    guard case .failure(RTSPError.connectionFailed(let message, let underlying)) = result else {
       Issue.record("expected connectionFailed, got \(result)")
       return
     }
     #expect(message.hasPrefix("TLS handshake failed: "), "got: \(message)")
+    #expect(isTLSError(underlying), "got: \(String(describing: underlying))")
     await expectTLSFailure(message) {
       try await client.send(Data("OPTIONS * RTSP/1.0\r\nCSeq: 2\r\n\r\n".utf8))
     }
@@ -585,11 +594,12 @@ struct TLSLinkLocalHostTests {
     if accepted {
       #expect(throws: Never.self) { try result.get() }
     } else {
-      guard case .failure(RTSPError.connectionFailed(let message)) = result else {
+      guard case .failure(RTSPError.connectionFailed(let message, let underlying)) = result else {
         Issue.record("expected connectionFailed, got \(result)")
         return
       }
       #expect(message.hasPrefix("TLS handshake failed: "), "got: \(message)")
+      #expect(isTLSError(underlying), "got: \(String(describing: underlying))")
     }
   }
 
@@ -605,11 +615,12 @@ struct TLSLinkLocalHostTests {
       try await client.connect(host: host, port: server.port, tls: TLSOptions(serverTrust: .system))
     }
     await client.close()
-    guard case .failure(RTSPError.connectionFailed(let message)) = result else {
+    guard case .failure(RTSPError.connectionFailed(let message, let underlying)) = result else {
       Issue.record("expected connectionFailed, got \(result)")
       return
     }
     #expect(message.hasPrefix("TLS handshake failed: "), "got: \(message)")
+    #expect(isTLSError(underlying), "got: \(String(describing: underlying))")
   }
 }
 
@@ -622,7 +633,7 @@ private func expectTLSFailure(
   do {
     try await body()
     Issue.record("expected the recorded failure", sourceLocation: sourceLocation)
-  } catch RTSPError.connectionFailed(let later) {
+  } catch RTSPError.connectionFailed(let later, _) {
     #expect(later == message, sourceLocation: sourceLocation)
   } catch {
     Issue.record("expected connectionFailed, got \(error)", sourceLocation: sourceLocation)

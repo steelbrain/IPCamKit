@@ -78,19 +78,34 @@ media section whose `a=control` is that long is dropped.
 closes what it opened, sending TEARDOWN first if the server had already
 created a session and the connection is still open (not after
 `RTSPError.timeout`, which closes it, or a dropped connection). `stop()`
-during `start()` closes the connection at once and makes `start()` throw
-`RTSPError.invalidState`. A session released without `stop()`,
-once no `frames()` sequence of it remains, stops itself.
+during `start()` closes the connection at once, without TEARDOWN, and makes
+`start()` throw `RTSPError.invalidState`. Cancelling the task awaiting
+`start()` also closes the connection at once, without TEARDOWN, and
+`start()` throws `CancellationError` rather than waiting out the connect and
+request deadlines (15 seconds each); in a task that is already cancelled,
+`start()` throws `CancellationError` without connecting. Either way the
+session is stopped. Cancelling the task after `start()` has returned doesn't
+affect the session. A session released without `stop()`, once no `frames()`
+sequence of it remains, stops itself.
 
 `user:password@` in the URL is used as the credentials when `credentials` is
-nil, and is removed from every request. Percent-encode `/`, `?`, `#` and `@`
+nil, and is removed from every request; when `credentials` is passed, the
+URL's user name and password are removed without being read. The user name
+runs to the first `:` and the password to the last `@` before the host. Each
+is percent-decoded once, whatever else it holds (`admin:P|ss%40word@` and
+`admin:£ecret|1@` give the passwords `P|ss@word` and `£ecret|1`), and one
+that doesn't decode to UTF-8 (`%FF`) makes `start()` throw
+`RTSPError.invalidURL`. Percent-encode `/`, `?`, `#` and `@`
 in a user name or password (`%2F`, `%3F`, `%23`, `%40`): a raw `/`, `?` or
 `#` ends the host early, and a raw `@` followed by another `@` after the host
 ends it at the wrong one, so the URL would name another host. `start()`
 rejects a URL with an `@` after its host when the URL also has
-`user:password@`, a port on a host name or IPv4 address, or any `:` between
-the host and the last `@`; in such a URL an `@` in the path or query must be
-written `%40` too. A user name with a raw
+`user:password@`, a port on a host name, or any `:` between the host and the
+last `@`; in such a URL an `@` in the path or query must be written `%40`
+too. An IPv4 address (four decimal numbers) or a bracketed IPv6 address with
+a port isn't taken for a user name and password, so stream URIs such as
+`rtsp://192.0.2.5:554/live?password=Adm1n@2024`, which ONVIF cameras report,
+are accepted. A user name with a raw
 `/`, `?` or `#` and no password can't be told from a path, and the URL is read
 as host and path. The same check applies to a tunnel URL, which must also write any `@` after
 its host as `%40`. These checks read the URL as Unicode scalars, as
@@ -99,8 +114,11 @@ combining mark still counts. A URL containing a
 space or an ASCII control character is rejected, and so is a host name with
 any character other than letters, digits, `-`, `.` and `_` (a percent-encoded
 one included; IPv6 literals aside). The URL goes into the request line as
-ASCII: a Unicode or percent-encoded host name goes as its `xn--` form, and a
-non-ASCII path or query is percent-encoded. Control URLs the server gives
+ASCII: a Unicode or percent-encoded host name goes as its `xn--` form, and
+non-ASCII characters in the path and query are percent-encoded. The rest of
+the path and query is sent as written, escapes and characters such as `{` and
+`|` included (`/live/a{%20b` is sent as `/live/a{%20b`), whether or not the
+URL has a user name or a Unicode host. Control URLs the server gives
 (`Content-Base`, SDP `a=control`) are sent as the server wrote them. A
 `#fragment` isn't sent. Errors that show the URL or a tunnel URL put `***`
 in place of everything from the scheme to the last `@` (or fullwidth `＠`
@@ -169,7 +187,8 @@ authentication are dropped; the first such SRTP packet and the first such
 SRTCP packet of each stream are reported via `onDiagnostic`. A replayed
 packet (a duplicate or one too late for the replay window) is dropped
 without a report. A failed TLS
-handshake makes `start()` throw `RTSPError.connectionFailed` with a message that
+handshake makes `start()` throw `RTSPError.connectionFailed`, whose `underlying`
+is Network's `.tls` error, with a message that
 begins `TLS handshake failed:`. When the certificate was rejected (Network
 reports OSStatus -9808, `errSSLBadCert`), it reads `TLS handshake failed: server
 certificate rejected by TLSOptions.serverTrust (OSStatus -9808)`. A server that
@@ -447,8 +466,16 @@ supports PAUSE and `Range`. While a PAUSE awaits its response, and from its
 success until a later `play()` succeeds, a TCP session (plain, TLS or
 tunneled) sends no RTCP receiver reports, because some servers close a
 paused connection that carries interleaved data, and `sendBackchannelAudio`
-throws `RTSPError.invalidState` on any transport. A `pause()` that throws
-(rejected, or no response) leaves the session as it was.
+throws `RTSPError.invalidState` on any transport. A `pause()` that throws an
+`RTSPError` (rejected, or no response) leaves the session as it was.
+
+When the task awaiting `play()` or `pause()` is cancelled, the call throws
+`CancellationError` at once instead of waiting for the response (up to 10
+seconds). A request not yet sent isn't sent. One already sent can't be taken
+back, so the session follows the server's answer as if the caller had
+waited: an accepted PAUSE pauses it, an accepted seek moves the playback, and
+a rejected seek is rolled back when the rejection arrives. A 401 to it isn't
+answered.
 
 ### Two-way audio
 
@@ -651,7 +678,8 @@ struct PublicRTCPPacket: Sendable {
 ```swift
 enum RTSPError: Error, Sendable, CustomStringConvertible, LocalizedError {
   // localizedDescription == description
-  case connectionFailed(String)
+  case invalidURL(String)            // the URL or tunnel URL can't be used
+  case connectionFailed(String, underlying: NWError? = nil)
   case authenticationFailed
   case sessionSetupFailed(statusCode: Int, reason: String)
   case transportNegotiationFailed
@@ -662,6 +690,23 @@ enum RTSPError: Error, Sendable, CustomStringConvertible, LocalizedError {
   case invalidState(String)          // API misuse, e.g. a tunnel with .udp
 }
 ```
+
+`invalidURL` means `start()` can't use the stream URL or the tunnel URL, and
+nothing was sent: a scheme other than `rtsp`/`rtsps` (`http`/`https` or
+`ws`/`wss` for a tunnel), no host or a host that isn't a valid name, a bad
+port, a space or control character, an `@` after the host that may end a
+password, or a user name or password that isn't percent-encoded UTF-8. The
+message names the problem; the URL in it has its credentials hidden.
+
+`connectionFailed` means the connection couldn't be opened, or failed after
+it was. `underlying` is the Network framework error behind it, when there is
+one: `.dns` for a name that didn't resolve (`cam.invalid` gives
+`.dns(-65554)`, NoSuchRecord), `.posix` for a refused or unreachable host or
+another socket error (`.posix(.ECONNREFUSED)`, `.posix(.EHOSTUNREACH)`,
+`.posix(.ECONNRESET)`; UDP and multicast socket errors too), and `.tls` for a
+failed TLS handshake or connection. It is nil for failures that don't come
+from the network, such as an HTTP tunnel or WebSocket upgrade the server
+refused, or an RTSP message that never ends.
 
 ## Advanced Types
 

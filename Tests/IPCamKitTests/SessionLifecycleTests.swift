@@ -5,6 +5,7 @@
 // requests (keepalive, re-authentication) and request hygiene.
 
 import Foundation
+import Network
 import Testing
 
 @testable import IPCamKit
@@ -57,6 +58,69 @@ private func streamVideo(
 private func isInvalidState(_ error: any Error) -> Bool {
   if case .invalidState = error as? RTSPError { return true }
   return false
+}
+
+/// A loopback TCP server that accepts connections, reads what arrives and
+/// never answers.
+private final class SilentServer: @unchecked Sendable {
+  private let lock = NSLock()
+  private let listener: NWListener
+  private let queue = DispatchQueue(label: "ipcamkit.tests.silent-server")
+  private var connections: [NWConnection] = []
+  private var received = 0
+  private var closed = 0
+  private(set) var port: UInt16 = 0
+
+  init() throws {
+    let params = NWParameters.tcp
+    params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    listener = try NWListener(using: params)
+  }
+
+  /// Bytes received so far, over every connection.
+  var receivedBytes: Int { lock.withLock { received } }
+  /// Connections the client has closed.
+  var closedConnections: Int { lock.withLock { closed } }
+
+  func start() async throws {
+    let queue = self.queue
+    listener.newConnectionHandler = { [weak self] connection in
+      guard let self else { return connection.cancel() }
+      self.lock.withLock { self.connections.append(connection) }
+      connection.start(queue: queue)
+      self.receive(on: connection)
+    }
+    let ready = AsyncStream<UInt16>.makeStream()
+    listener.stateUpdateHandler = { [listener] state in
+      if case .ready = state { ready.continuation.yield(listener.port?.rawValue ?? 0) }
+      if case .failed = state { ready.continuation.finish() }
+    }
+    listener.start(queue: queue)
+    for await port in ready.stream {
+      self.port = port
+      break
+    }
+    guard port != 0 else { throw RTSPError.connectionFailed("silent server didn't start") }
+  }
+
+  private func receive(on connection: NWConnection) {
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
+      [weak self] data, _, isComplete, error in
+      guard let self else { return }
+      self.lock.withLock { self.received += data?.count ?? 0 }
+      if isComplete || error != nil {
+        self.lock.withLock { self.closed += 1 }
+        connection.cancel()
+      } else {
+        self.receive(on: connection)
+      }
+    }
+  }
+
+  func stop() {
+    listener.cancel()
+    for connection in lock.withLock({ connections }) { connection.cancel() }
+  }
 }
 
 @Suite("Session lifecycle")
@@ -1567,6 +1631,159 @@ struct SessionLifecycleTests {
     if case .failure(let error) = result { #expect(isInvalidState(error)) }
     #expect(await poll { server.sessionHandles.allSatisfy(\.isClosed) })
     #expect(server.requests(method: "PLAY").isEmpty)
+  }
+
+  /// start() waited out each request's 15-second deadline and then threw
+  /// `RTSPError.timeout`, whatever happened to the task awaiting it.
+  @Test("Cancelling start() against a server that never answers ends it at once")
+  func cancelStartWithoutResponse() async throws {
+    let server = try SilentServer()
+    try await server.start()
+    defer { server.stop() }
+    let session = RTSPClientSession(url: "rtsp://127.0.0.1:\(server.port)/stream")
+    let starter = Task { try await session.start() }
+    #expect(await poll { server.receivedBytes > 0 })
+    let cancelled = ContinuousClock.now
+    starter.cancel()
+    let result = await starter.result
+    #expect(ContinuousClock.now - cancelled < .seconds(1))
+    guard case .failure(let error) = result, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(result)")
+      return
+    }
+    #expect(await poll { server.closedConnections == 1 })
+    // The session is over, as after any failed start().
+    await #expect { try await session.start() } throws: { isInvalidState($0) }
+  }
+
+  @Test(
+    "Cancelling start() during SETUP closes the connection without PLAY or TEARDOWN",
+    arguments: [Transport.tcp, .udp])
+  func cancelDuringSetup(transport: Transport) async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    server.onRequest = { request in
+      if request.method == "SETUP" { Thread.sleep(forTimeInterval: 0.3) }
+      return nil
+    }
+    try await server.start()
+    defer { server.stop() }
+    let session = RTSPClientSession(url: server.url, transport: transport)
+    let starter = Task { try await session.start() }
+    _ = await server.waitForRequest(method: "SETUP")
+    starter.cancel()
+    let result = await starter.result
+    guard case .failure(let error) = result, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(result)")
+      return
+    }
+    #expect(await poll { server.sessionHandles.allSatisfy(\.isClosed) })
+    #expect(server.requests(method: "PLAY").isEmpty)
+    #expect(server.requests(method: "TEARDOWN").isEmpty)
+  }
+
+  @Test("start() in a task already cancelled throws CancellationError without connecting")
+  func startInCancelledTask() async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    try await server.start()
+    defer { server.stop() }
+    let session = RTSPClientSession(url: server.url)
+    let starter = Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return try await session.start()
+    }
+    let result = await starter.result
+    guard case .failure(let error) = result, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(result)")
+      return
+    }
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(server.requests.isEmpty)
+    await #expect { try await session.start() } throws: { isInvalidState($0) }
+  }
+
+  @Test("Cancelling a task after its start() returned leaves the session running")
+  func cancelAfterStart() async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    try await server.start()
+    defer { server.stop() }
+    let session = RTSPClientSession(url: server.url)
+    let started = AsyncStream<Void>.makeStream()
+    let starter = Task {
+      _ = try await session.start()
+      started.continuation.yield()
+      // Stay alive until cancelled.
+      try? await Task.sleep(for: .seconds(30))
+    }
+    for await _ in started.stream { break }
+    starter.cancel()
+    _ = await starter.result
+    try await Task.sleep(for: .milliseconds(200))
+    try await session.play(PlayOptions())
+    #expect(server.requests(method: "TEARDOWN").isEmpty)
+    #expect(!server.sessionHandles.isEmpty)
+    await session.stop()
+  }
+
+  @Test("play() or pause() in a task already cancelled throws CancellationError and sends nothing")
+  func playPauseInCancelledTask() async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    try await server.start()
+    defer { server.stop() }
+    let session = RTSPClientSession(url: server.url)
+    _ = try await session.start()
+    for method in ["PLAY", "PAUSE"] {
+      let call = Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        if method == "PLAY" {
+          try await session.play(PlayOptions())
+        } else {
+          try await session.pause()
+        }
+      }
+      let result = await call.result
+      #expect(throws: CancellationError.self, "\(method)") { try result.get() }
+    }
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(server.requests(method: "PLAY").count == 1)
+    #expect(server.requests(method: "PAUSE").isEmpty)
+    // The session is unaffected.
+    try await session.pause()
+    await session.stop()
+  }
+
+  @Test("A 401 to a cancelled play() isn't answered", .timeLimit(.minutes(1)))
+  func cancelledPlayNotRetriedAfter401() async throws {
+    let server = FakeRTSPServer(sdp: h264VideoOnlySDP())
+    let started = Shared(false)
+    let arrived = Shared(false)
+    server.onRequest = { request in
+      guard started.value, request.method == "PLAY", request.header("Authorization") == nil
+      else { return nil }
+      arrived.value = true
+      Thread.sleep(forTimeInterval: 0.5)
+      return FakeRTSPResponse(
+        statusCode: 401, headers: [("WWW-Authenticate", #"Basic realm="camera""#)])
+    }
+    try await server.start()
+    defer { server.stop() }
+    let session = RTSPClientSession(
+      url: server.url, credentials: Credentials(username: "admin", password: "secret"))
+    _ = try await session.start()
+    started.value = true
+    let play = Task { try await session.play(PlayOptions()) }
+    #expect(await poll { arrived.value })
+    play.cancel()
+    let result = await play.result
+    #expect(throws: CancellationError.self) { try result.get() }
+    try await Task.sleep(for: .seconds(1))
+    let plays = server.requests(method: "PLAY")
+    #expect(plays.count == 2, "\(plays.map { $0.header("Authorization") ?? "-" })")
+    #expect(plays.last?.header("Authorization") == nil)
+    // The challenge is kept: the next request answers it.
+    try await session.pause()
+    let expected = "Basic " + Data("admin:secret".utf8).base64EncodedString()
+    #expect(server.requests(method: "PAUSE").last?.header("Authorization") == expected)
+    await session.stop()
   }
 
   @Test("start() against a server that never answers times out", arguments: ["OPTIONS", "SETUP"])

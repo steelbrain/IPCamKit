@@ -1368,6 +1368,65 @@ struct ONVIFSessionTests {
     await session.stop()
   }
 
+  /// pause() and play() waited out the server (up to the 10-second response
+  /// deadline) whatever happened to the task awaiting them.
+  @Test(
+    "Cancelling pause() or play() ends the wait at once; the server's answer still applies",
+    .timeLimit(.minutes(1)))
+  func cancelledPauseAndPlayStillApply() async throws {
+    let server = backchannelServer()
+    let delayed = Box<String?>(nil)
+    let arrived = Box(false)
+    server.onRequest = { request in
+      if request.method == delayed.value {
+        arrived.value = true
+        Thread.sleep(forTimeInterval: 1.5)
+      }
+      return nil
+    }
+    try await server.start()
+    let watchdog = serverWatchdog(server, after: .seconds(30))
+    defer {
+      watchdog.cancel()
+      server.stop()
+    }
+    let session = RTSPClientSession(url: server.url, onvif: .backchannel)
+    _ = try await session.start()
+    let chunk = Data(repeating: 0xFF, count: 160)
+
+    delayed.value = "PAUSE"
+    let pause = Task { try await session.pause() }
+    #expect(await eventually { arrived.value })
+    var cancelled = ContinuousClock.now
+    pause.cancel()
+    let paused = await pause.result
+    #expect(ContinuousClock.now - cancelled < .milliseconds(500))
+    #expect(throws: CancellationError.self) { try paused.get() }
+    // Once the server has accepted the PAUSE, the session is paused: two-way
+    // audio is refused.
+    _ = await server.waitForRequest(method: "PAUSE")
+    try await Task.sleep(for: .milliseconds(300))
+    let whilePaused = await outcome { try await session.sendBackchannelAudio(chunk) }
+    guard case .failure(RTSPError.invalidState) = whilePaused else {
+      Issue.record("expected RTSPError.invalidState while paused, got \(whilePaused)")
+      await session.stop()
+      return
+    }
+
+    arrived.value = false
+    delayed.value = "PLAY"
+    let play = Task { try await session.play(PlayOptions()) }
+    #expect(await eventually { arrived.value })
+    cancelled = ContinuousClock.now
+    play.cancel()
+    let resumed = await play.result
+    #expect(ContinuousClock.now - cancelled < .milliseconds(500))
+    #expect(throws: CancellationError.self) { try resumed.get() }
+    // Once the server has accepted the PLAY, two-way audio goes through.
+    #expect(await eventually { (try? await session.sendBackchannelAudio(chunk)) != nil })
+    await session.stop()
+  }
+
   @Test(
     "Backchannel: a call cancelled before sending uses no sequence number",
     .timeLimit(.minutes(1)))

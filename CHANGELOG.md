@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- `RTSPError.connectionFailed` carries the Network framework error behind a
+  failure: it is now `connectionFailed(String, underlying: NWError? = nil)`.
+  `underlying` is `.dns` for a name that didn't resolve, `.posix` for a
+  refused or unreachable host or another socket error (UDP and multicast
+  sockets included), and `.tls` for a failed TLS handshake or connection; it
+  is nil for failures that don't come from the network, such as a refused
+  HTTP tunnel. A pattern that binds only the message,
+  `case .connectionFailed(let message)`, now binds a tuple and warns; write
+  `case .connectionFailed(let message, _)`.
+- New `RTSPError.invalidURL(String)` for a stream or tunnel URL that
+  `start()` can't use: a wrong scheme, no host or an invalid one, a bad port,
+  a space or control character, an `@` after the host that may end a
+  password, or a user name or password that isn't percent-encoded UTF-8.
+  These were `connectionFailed` before. Their messages are unchanged, and
+  `description` is the message alone, without `Connection failed: ` in
+  front. A `switch` over `RTSPError` needs the new case.
+
+### Changes
+
+- `start()` honours task cancellation. Cancelling the task awaiting it closes
+  the connection at once, without TEARDOWN, and `start()` throws
+  `CancellationError`. Before, it waited out the connect deadline and each
+  request's deadline (15 seconds each) and then threw `RTSPError.timeout`.
+  In a task already cancelled, `start()` throws `CancellationError` without
+  connecting. Cancelling the task after `start()` has returned doesn't affect
+  the session.
+- `play(_:)` and `pause()` honour task cancellation too: the call throws
+  `CancellationError` at once instead of waiting up to 10 seconds for the
+  response. A request not yet sent isn't sent. One already sent can't be taken
+  back, so the session still follows the server's answer (an accepted PAUSE
+  pauses it, an accepted seek moves the playback, a rejected seek is rolled
+  back), except that a 401 to it isn't answered.
+- A URL with an IPv4 address and a port may have an `@` after the host, as
+  one with a bracketed IPv6 address and a port already could: ONVIF cameras
+  report stream URIs such as `rtsp://192.0.2.5:554/live?password=Adm1n@2024`.
+  With a host name and a port, such a URL is still rejected.
+
+### Fixes
+
+- A user name or password in the URL that holds a character `URLComponents`
+  has to percent-encode itself (`"`, `<`, `>`, `[`, `\`, `]`, `^`, `` ` ``,
+  `{`, `|`, `}`, a `%` that two hex digits don't follow, an `@` before the
+  last one, or a `:` after the first) is decoded once. Before, the escapes
+  in it, those for non-ASCII characters included, came back undecoded, and
+  every request authenticated with the wrong password: `admin:£ecret|1@`
+  sent `%C2%A3ecret|1`, `admin:P|ss%40word@` sent `P|ss%40word`, and
+  `admin:p@ss%21@` sent `p@ss%21`. A user name or password that isn't
+  percent-encoded UTF-8 is rejected whatever else it holds; `pw%E9|` was
+  sent as written. A user name or password starting with U+FEFF (`%EF%BB%BF`)
+  keeps it; it was dropped.
+- The path and query of a URL with a user name and password, or with a
+  Unicode or percent-encoded host name, reach the request line as written.
+  When they held a character `URLComponents` encodes, their escapes were
+  encoded a second time: `rtsp://admin:pw@cam/live/a{%20b` was requested as
+  `rtsp://cam/live/a%7B%2520b`, a different resource from the one the same
+  URL names without the login.
+- With `credentials` passed, the URL's own user name and password are only
+  removed, not decoded, so one that isn't UTF-8
+  (`rtsp://admin:pw%FF@cam/s`) no longer makes `start()` throw.
+
 ## 0.4.0
 
 ### New

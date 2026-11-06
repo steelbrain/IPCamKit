@@ -280,7 +280,7 @@ private func expectJoinFailure(
     let pair = try await join()
     pair.close()
     Issue.record("join should have thrown", sourceLocation: sourceLocation)
-  } catch RTSPError.connectionFailed(let message) {
+  } catch RTSPError.connectionFailed(let message, _) {
     #expect(message.contains(fragment), "got: \(message)", sourceLocation: sourceLocation)
   } catch {
     Issue.record("expected connectionFailed, got \(error)", sourceLocation: sourceLocation)

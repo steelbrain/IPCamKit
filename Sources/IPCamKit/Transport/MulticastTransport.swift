@@ -4,6 +4,7 @@
 
 import Darwin
 import Foundation
+import Network
 
 /// Receives one RTP stream's RTP and RTCP datagrams from an IP multicast group,
 /// as negotiated by a SETUP with `Transport: RTP/AVP;multicast` (the server's
@@ -183,12 +184,16 @@ final class MulticastPair: @unchecked Sendable {
     let context = "Multicast join of \(cutForMessage(group.text)) port \(port)"
     let fd = socket(group.isIPv6 ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     guard fd >= 0 else {
-      throw RTSPError.connectionFailed("\(context) failed: socket: \(describeErrno(errno))")
+      let code = errno
+      throw RTSPError.connectionFailed(
+        "\(context) failed: socket: \(describeErrno(code))", underlying: NWError(errno: code))
     }
     do {
       func check(_ result: Int32, _ call: String) throws {
         guard result == 0 else {
-          throw RTSPError.connectionFailed("\(context) failed: \(call): \(describeErrno(result))")
+          throw RTSPError.connectionFailed(
+            "\(context) failed: \(call): \(describeErrno(result))",
+            underlying: NWError(errno: result))
         }
       }
       try check(setOption(fd, SOL_SOCKET, SO_REUSEADDR, Int32(1)), "SO_REUSEADDR")
@@ -366,8 +371,8 @@ final class MulticastPair: @unchecked Sendable {
         source.cancel()
         onError?(
           RTSPError.connectionFailed(
-            "Multicast receive on \(cutForMessage(group)) port \(port) failed: \(Self.describeErrno(code))"
-          ))
+            "Multicast receive on \(cutForMessage(group)) port \(port) failed: \(Self.describeErrno(code))",
+            underlying: NWError(errno: code)))
         return
       }
       guard count > 0, sourceFilter?.matches(sender) ?? true else { continue }

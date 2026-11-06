@@ -80,13 +80,13 @@ struct HTTPEndpoint: Sendable, Equatable {
     guard let components = URLComponents(url: url, resolvingAgainstBaseURL: true),
       let host = asciiHost(of: components)
     else {
-      throw RTSPError.connectionFailed("Invalid URL: \(redactedURL(url.absoluteString))")
+      throw RTSPError.invalidURL("Invalid URL: \(redactedURL(url.absoluteString))")
     }
     switch components.scheme?.lowercased() {
     case plainScheme: usesTLS = false
     case tlsScheme: usesTLS = true
     default:
-      throw RTSPError.connectionFailed(
+      throw RTSPError.invalidURL(
         "Unsupported URL scheme in \(redactedURL(url.absoluteString)) (expected \(plainScheme):// or "
           + "\(tlsScheme)://)")
     }
@@ -98,18 +98,18 @@ struct HTTPEndpoint: Sendable, Equatable {
       components.percentEncodedPath + (components.percentEncodedQuery ?? "")
       + (components.percentEncodedFragment ?? "")
     guard !afterHost.contains("@") else {
-      throw RTSPError.connectionFailed(
+      throw RTSPError.invalidURL(
         "Invalid URL (write @ after the host as %40): \(redactedURL(url.absoluteString))")
     }
     // A port too large for `Int` reads as no port, which would mean the
     // default one; an empty port (`host:`, `[::1]:`) does mean it.
     guard components.port != nil || components.rangeOfPort?.isEmpty != false else {
-      throw RTSPError.connectionFailed(
+      throw RTSPError.invalidURL(
         "Invalid port in URL: \(redactedURL(url.absoluteString))")
     }
     let rawPort = components.port ?? (usesTLS ? 443 : 80)
     guard let port = UInt16(exactly: rawPort), port != 0 else {
-      throw RTSPError.connectionFailed(
+      throw RTSPError.invalidURL(
         "Invalid port \(rawPort) in URL: \(redactedURL(url.absoluteString))")
     }
     self.port = port
@@ -124,7 +124,7 @@ struct HTTPEndpoint: Sendable, Equatable {
     // but the target goes verbatim into a request line, so make sure.
     guard !target.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7F })
     else {
-      throw RTSPError.connectionFailed(
+      throw RTSPError.invalidURL(
         "Invalid request path in URL: \(redactedURL(url.absoluteString))")
     }
     self.target = target
@@ -623,7 +623,8 @@ final class TunnelPostMonitor: @unchecked Sendable {
         record(
           connection.failure(after: error)
             ?? .connectionFailed(
-              "HTTP tunnel POST connection failed: \(error.localizedDescription)"))
+              "HTTP tunnel POST connection failed: \(error.localizedDescription)",
+              underlying: error))
         return
       }
       if let content, !content.isEmpty {

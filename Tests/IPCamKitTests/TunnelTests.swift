@@ -561,7 +561,7 @@ struct HTTPTunnelTests {
         failure = error
       }
     }
-    guard case .connectionFailed(let message)? = failure as? RTSPError else {
+    guard case .connectionFailed(let message, _)? = failure as? RTSPError else {
       Issue.record("expected connectionFailed, got \(String(describing: failure))")
       return
     }
@@ -641,7 +641,7 @@ struct HTTPTunnelTests {
     let result = await reader.value
     let elapsed = ContinuousClock.now - rejected
     #expect(elapsed < .seconds(2), "the read ended \(elapsed) after the rejection")
-    guard case .failure(RTSPError.connectionFailed(let message)) = result else {
+    guard case .failure(RTSPError.connectionFailed(let message, _)) = result else {
       Issue.record("expected connectionFailed, got \(result)")
       return
     }
@@ -685,7 +685,7 @@ struct HTTPTunnelTests {
       return get
     }
     let result = await outcome { try await session.start() }
-    guard case .failure(RTSPError.connectionFailed(let message)) = result else {
+    guard case .failure(RTSPError.connectionFailed(let message, _)) = result else {
       Issue.record("expected connectionFailed, got \(result)")
       return
     }
@@ -733,7 +733,7 @@ struct HTTPTunnelTests {
     let elapsed = ContinuousClock.now - started
     #expect(elapsed < .seconds(2), "start() took \(elapsed)")
     switch result {
-    case .failure(RTSPError.connectionFailed(let message)) where status == 404:
+    case .failure(RTSPError.connectionFailed(let message, _)) where status == 404:
       #expect(message.contains("404"), "got: \(message)")
     case .failure(RTSPError.authenticationFailed) where status == 401:
       break
@@ -765,7 +765,7 @@ struct HTTPTunnelTests {
     do {
       try await client.connectHTTPTunnel(url: url, tls: .default, credentials: nil, userAgent: nil)
       Issue.record("connect should fail")
-    } catch RTSPError.connectionFailed(let message) {
+    } catch RTSPError.connectionFailed(let message, _) {
       #expect(message.contains("404"), "got: \(message)")
       #expect(message.contains("Not Found"), "got: \(message)")
     }
@@ -1176,7 +1176,7 @@ struct HTTPTunnelTests {
     do {
       try await client.connectHTTPTunnel(url: url, tls: .default, credentials: nil, userAgent: nil)
       Issue.record("connect should fail")
-    } catch RTSPError.connectionFailed(let message) {
+    } catch RTSPError.connectionFailed(let message, _) {
       #expect(message.contains("did not answer with HTTP"), "got: \(message)")
     }
     _ = try await serverTask.value
@@ -1189,7 +1189,7 @@ struct HTTPTunnelTests {
     do {
       try await client.connectHTTPTunnel(url: url, tls: .default, credentials: nil, userAgent: nil)
       Issue.record("connect should fail")
-    } catch RTSPError.connectionFailed(let message) {
+    } catch RTSPError.invalidURL(let message) {
       #expect(message.contains("Unsupported URL scheme"), "got: \(message)")
     }
   }
@@ -1412,7 +1412,7 @@ struct WebSocketTransportTests {
     do {
       _ = try await client.receiveMessage()
       Issue.record("read should fail")
-    } catch RTSPError.connectionFailed(let message) {
+    } catch RTSPError.connectionFailed(let message, _) {
       #expect(message.contains("masked"), "got: \(message)")
     }
     let close = try await peer.readFrame()
@@ -1500,7 +1500,7 @@ struct WebSocketTransportTests {
       do {
         try await client.connectWebSocket(url: url, tls: .default, credentials: nil, userAgent: nil)
         Issue.record("\(name): connect should fail")
-      } catch RTSPError.connectionFailed(let message) {
+      } catch RTSPError.connectionFailed(let message, _) {
         #expect(message.contains(expected), "\(name): got \(message)")
       }
       _ = try await serverTask.value

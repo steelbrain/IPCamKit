@@ -616,9 +616,13 @@ private func expectTLSRejection(
   do {
     _ = try await session.start()
     Issue.record("start() should fail the TLS handshake", sourceLocation: sourceLocation)
-  } catch RTSPError.connectionFailed(let message) {
+  } catch RTSPError.connectionFailed(let message, let underlying) {
     #expect(
       message.hasPrefix("TLS handshake failed: server certificate rejected"), "got: \(message)",
+      sourceLocation: sourceLocation)
+    let isTLS = if case .tls? = underlying { true } else { false }
+    #expect(
+      isTLS, "expected a TLS NWError, got \(String(describing: underlying))",
       sourceLocation: sourceLocation)
   } catch {
     Issue.record("expected connectionFailed, got \(error)", sourceLocation: sourceLocation)

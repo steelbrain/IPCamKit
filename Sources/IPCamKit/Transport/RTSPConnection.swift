@@ -506,7 +506,7 @@ struct ConnectionOpener: Sendable {
   func open(host: String, port: UInt16, tls: TLSOptions?) async throws -> WatchedConnection {
     let nwHost = NWEndpoint.Host(host)
     guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-      throw RTSPError.connectionFailed("Invalid port \(port)")
+      throw RTSPError.invalidURL("Invalid port \(port)")
     }
     let parameters: NWParameters
     if let tls {
@@ -550,13 +550,17 @@ struct ConnectionOpener: Sendable {
             settle(.success(()))
           case .failed(let error):
             settle(
-              .failure(RTSPError.connectionFailed(RTSPTransportConnection.describe(error))))
+              .failure(
+                RTSPError.connectionFailed(
+                  RTSPTransportConnection.describe(error), underlying: error)))
           case .waiting(let error):
             if case .tls = error {
               // NWConnection also parks a rejected certificate in .waiting.
               // Retrying the handshake cannot change the verdict, so fail now.
               settle(
-                .failure(RTSPError.connectionFailed(RTSPTransportConnection.describe(error))))
+                .failure(
+                  RTSPError.connectionFailed(
+                    RTSPTransportConnection.describe(error), underlying: error)))
               break
             }
             // NWConnection parks in .waiting for ECONNREFUSED/EHOSTUNREACH
@@ -566,7 +570,9 @@ struct ConnectionOpener: Sendable {
             // (the one-shot guard makes this deferred settle a no-op).
             graceQueue.asyncAfter(deadline: .now() + grace) {
               settle(
-                .failure(RTSPError.connectionFailed(RTSPTransportConnection.describe(error))))
+                .failure(
+                  RTSPError.connectionFailed(
+                    RTSPTransportConnection.describe(error), underlying: error)))
             }
           case .cancelled:
             settle(.failure(RTSPError.unexpectedDisconnection))
@@ -638,7 +644,8 @@ final class WatchedConnection: @unchecked Sendable {
     if let failure { throw failure }
     guard let error = await sendResult(data, on: nwConnection) else { return }
     throw await settledFailure(after: error)
-      ?? RTSPError.connectionFailed("Send failed: \(error.localizedDescription)")
+      ?? RTSPError.connectionFailed(
+        "Send failed: \(error.localizedDescription)", underlying: error)
   }
 
   /// `send(_:)` for a caller that orders its sends under its own lock:
@@ -660,7 +667,8 @@ final class WatchedConnection: @unchecked Sendable {
     guard let result else { throw refused }
     guard let error = result else { return }
     throw await settledFailure(after: error)
-      ?? RTSPError.connectionFailed("Send failed: \(error.localizedDescription)")
+      ?? RTSPError.connectionFailed(
+        "Send failed: \(error.localizedDescription)", underlying: error)
   }
 
   /// Read the next chunk (at most 64 KiB). Returns `nil` once the peer has
@@ -676,7 +684,8 @@ final class WatchedConnection: @unchecked Sendable {
       return nil
     case .failure(let error):
       throw await settledFailure(after: error)
-        ?? RTSPError.connectionFailed("Read error: \(error.localizedDescription)")
+        ?? RTSPError.connectionFailed(
+          "Read error: \(error.localizedDescription)", underlying: error)
     }
   }
 
@@ -742,7 +751,8 @@ final class WatchedConnection: @unchecked Sendable {
     lock.lock()
     if !closing && recordedFailure == nil {
       recordedFailure = .connectionFailed(
-        RTSPTransportConnection.describeAfterReady(error, dataReceived: dataReceived))
+        RTSPTransportConnection.describeAfterReady(error, dataReceived: dataReceived),
+        underlying: error)
     }
     lock.unlock()
     nwConnection.cancel()
@@ -752,7 +762,8 @@ final class WatchedConnection: @unchecked Sendable {
 /// Send `data` on `connection`, resuming once Network has processed it.
 func sendData(_ data: Data, on connection: NWConnection) async throws {
   if let error = await sendResult(data, on: connection) {
-    throw RTSPError.connectionFailed("Send failed: \(error.localizedDescription)")
+    throw RTSPError.connectionFailed(
+      "Send failed: \(error.localizedDescription)", underlying: error)
   }
 }
 
@@ -763,7 +774,8 @@ func receiveChunk(from connection: NWConnection) async throws -> Data? {
   case .success(let chunk):
     return chunk
   case .failure(let error):
-    throw RTSPError.connectionFailed("Read error: \(error.localizedDescription)")
+    throw RTSPError.connectionFailed(
+      "Read error: \(error.localizedDescription)", underlying: error)
   }
 }
 

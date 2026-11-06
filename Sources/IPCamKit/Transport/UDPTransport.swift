@@ -234,7 +234,9 @@ final class UDPPair: @unchecked Sendable {
           }
         }
         guard result == 0 else {
-          throw RTSPError.connectionFailed("UDP connect failed: \(Self.describeErrno(errno))")
+          let code = errno
+          throw RTSPError.connectionFailed(
+            "UDP connect failed: \(Self.describeErrno(code))", underlying: NWError(errno: code))
         }
       }
       rtpPeer = rtpEndpoint
@@ -296,7 +298,8 @@ final class UDPPair: @unchecked Sendable {
         case EAGAIN, EWOULDBLOCK, ENOBUFS:
           return
         default:
-          throw RTSPError.connectionFailed("UDP send failed: \(Self.describeErrno(code))")
+          throw RTSPError.connectionFailed(
+            "UDP send failed: \(Self.describeErrno(code))", underlying: NWError(errno: code))
         }
       }
     }
@@ -388,7 +391,8 @@ final class UDPPair: @unchecked Sendable {
       guard code == 0 else {
         onError?(
           RTSPError.connectionFailed(
-            "UDP \(name) receive on local port \(port) failed: \(Self.describeErrno(code))"))
+            "UDP \(name) receive on local port \(port) failed: \(Self.describeErrno(code))",
+            underlying: NWError(errno: code)))
         return
       }
       guard count > 0, Endpoint(sender) == peer else { continue }

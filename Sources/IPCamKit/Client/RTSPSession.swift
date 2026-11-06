@@ -220,23 +220,34 @@ public final class RTSPClientSession: Sendable {
   /// `PlayOptions(range: .clock(start: date))`. A `play.scale` out of range
   /// throws `RTSPError.invalidState` before connecting.
   ///
+  /// Cancelling the task awaiting `start()` closes the connection at once,
+  /// without TEARDOWN, as `stop()` during `start()` does, and `start()` throws
+  /// `CancellationError`; in a task already cancelled it throws that without
+  /// connecting. Either way the session is stopped. Cancelling the task after
+  /// `start()` has returned doesn't affect the session.
+  ///
   /// Returns session info including codec parameters for decoder setup.
   public func start(_ play: PlayOptions = PlayOptions()) async throws -> SessionDescription {
     try play.validate()
-    return try await state.start(
-      url: url,
-      credentials: credentials,
-      transport: transport,
-      tls: tls,
-      tunnel: tunnel,
-      onvif: onvif,
-      userAgent: userAgent,
-      onDiagnostic: onDiagnostic,
-      keepaliveInterval: keepaliveInterval,
-      receiverReportInterval: receiverReportInterval,
-      setupResponseTimeout: setupResponseTimeout,
-      play: play
-    )
+    let state = self.state
+    return try await withTaskCancellationHandler {
+      try await state.start(
+        url: url,
+        credentials: credentials,
+        transport: transport,
+        tls: tls,
+        tunnel: tunnel,
+        onvif: onvif,
+        userAgent: userAgent,
+        onDiagnostic: onDiagnostic,
+        keepaliveInterval: keepaliveInterval,
+        receiverReportInterval: receiverReportInterval,
+        setupResponseTimeout: setupResponseTimeout,
+        play: play
+      )
+    } onCancel: {
+      Task { await state.cancelStart() }
+    }
   }
 
   /// Send another PLAY: seek (`range`, usually with `immediate: true`), change
@@ -264,6 +275,12 @@ public final class RTSPClientSession: Sendable {
   /// `RTSPError.timeout` with no response within 10 seconds; and
   /// `RTSPError.unexpectedDisconnection` or `.connectionFailed` when the
   /// connection is gone.
+  ///
+  /// When the calling task is cancelled, this throws `CancellationError` at
+  /// once. A PLAY not yet sent isn't sent. One already sent can't be taken
+  /// back, so the session follows the server's answer as if the caller had
+  /// waited (an accepted seek moves the playback, a rejected one is rolled
+  /// back), except that a 401 to it isn't answered.
   public func play(_ options: PlayOptions) async throws {
     try options.validate()
     try await state.play(options)
@@ -274,8 +291,10 @@ public final class RTSPClientSession: Sendable {
   /// response, and from its success until a PLAY sent after it succeeds,
   /// RTCP receiver reports stop over TCP (some servers close a paused
   /// connection that carries interleaved data) and `sendBackchannelAudio`
-  /// throws; a `pause()` that throws leaves the session as it was. Throws as
-  /// `play(_:)` does.
+  /// throws; a `pause()` that throws an `RTSPError` leaves the session as it
+  /// was. Throws, and handles cancellation, as `play(_:)` does: a PAUSE sent
+  /// before the caller was cancelled still pauses the session once the
+  /// server accepts it.
   public func pause() async throws {
     try await state.pause()
   }
@@ -334,7 +353,9 @@ public final class RTSPClientSession: Sendable {
   }
 
   /// Graceful disconnect (TEARDOWN). Called during `start()`, it closes the
-  /// connection at once (without TEARDOWN) and `start()` throws.
+  /// connection at once (without TEARDOWN) and `start()` throws
+  /// `RTSPError.invalidState`. Cancelling the task awaiting `start()` does the
+  /// same, except that `start()` throws `CancellationError`.
   public func stop() async {
     await state.stop()
   }
@@ -1034,6 +1055,12 @@ actor SessionState {
       throw RTSPError.invalidState(
         "start() runs once per session; create a new RTSPClientSession to reconnect")
     }
+    // A task already cancelled doesn't connect; the session ends as after any
+    // failed start().
+    guard !Task.isCancelled else {
+      phase = .stopped
+      throw CancellationError()
+    }
     phase = .starting
     self.setupResponseTimeout = setupResponseTimeout
     do {
@@ -1052,6 +1079,7 @@ actor SessionState {
       return description
     } catch {
       await abandonStart()
+      if Task.isCancelled { throw CancellationError() }
       if stopRequested {
         throw RTSPError.invalidState("stop() was called while start() was running")
       }
@@ -1059,26 +1087,44 @@ actor SessionState {
     }
   }
 
-  /// Throw if `stop()` arrived while `start()` was suspended.
+  /// The task awaiting `start()` was cancelled: while `start()` runs, end it
+  /// as `stop()` would (close the connection at once; `start()` then sees the
+  /// cancellation and throws `CancellationError`). A session already running
+  /// or stopped is left alone.
+  func cancelStart() async {
+    guard phase == .starting else { return }
+    await stop()
+  }
+
+  /// Throw if `stop()` arrived, or the task awaiting `start()` was cancelled,
+  /// while `start()` was suspended. Used only on the `start()` path.
   private func checkNotStopped() throws {
+    if Task.isCancelled { throw CancellationError() }
     if stopRequested {
       throw RTSPError.invalidState("stop() was called while start() was running")
     }
   }
 
   /// Release everything a failed or stopped `start()` opened. After a genuine
-  /// failure (not `stop()`), a session the server already created gets a
-  /// best-effort TEARDOWN, bounded to 2 seconds.
+  /// failure (not `stop()` or cancellation), a session the server already
+  /// created gets a best-effort TEARDOWN, bounded to 2 seconds; cancelling
+  /// the task during that TEARDOWN closes the connection at once.
   private func abandonStart() async {
     phase = .stopped
     isPlaying = false
     let conn = connection
-    if !stopRequested, let conn, sessionId != nil, let url = aggregateURL ?? self.url {
+    if !stopRequested, !Task.isCancelled, let conn, sessionId != nil,
+      let url = aggregateURL ?? self.url
+    {
       let deadline = Task {
         try? await Task.sleep(for: .seconds(2))
         await conn.close()
       }
-      _ = try? await sendRequest(method: .teardown, url: url)
+      _ = await withTaskCancellationHandler {
+        try? await sendRequest(method: .teardown, url: url)
+      } onCancel: {
+        Task { await conn.close() }
+      }
       deadline.cancel()
     }
     await conn?.close()
@@ -1117,10 +1163,11 @@ actor SessionState {
     // space instead of rejecting it.
     try checkURLCharacters(requestedURL)
     try checkAmbiguousUserInfo(requestedURL)
-    let (userInfoFree, urlCredentials) = try splitUserInfo(requestedURL)
+    // The URL's user name and password are decoded only when no credentials
+    // were passed; otherwise they are only removed.
+    let credentials = try explicitCredentials ?? credentialsInUserInfo(requestedURL)
     // The request line must be ASCII: a Unicode host name goes as `xn--…`.
-    let url = withoutFragment(asciiURL(userInfoFree))
-    let credentials = explicitCredentials ?? urlCredentials
+    let url = withoutFragment(asciiURL(removingUserInfo(requestedURL)))
     let endpoint = try rtspEndpoint(for: url, shownAs: requestedURL)
     if tunnel != nil && transport != .tcp {
       throw RTSPError.invalidState(
@@ -1785,7 +1832,9 @@ actor SessionState {
     } catch let error as CancellationError {
       throw error
     } catch {
-      throw RTSPError.connectionFailed("Sending backchannel audio failed: \(error)")
+      throw RTSPError.connectionFailed(
+        "Sending backchannel audio failed: \(error)",
+        underlying: (error as? RTSPError)?.underlyingNetworkError)
     }
   }
 
@@ -1830,7 +1879,27 @@ actor SessionState {
 
   // MARK: - Playback control
 
+  /// The PLAY and what follows from its answer run in a task of their own,
+  /// which the caller waits for unless it is cancelled (see
+  /// `valueUnlessCancelled`): RTSP can't take back a request that was sent,
+  /// and the session must follow the server's answer (an accepted seek moves
+  /// the playback; a rejected one is rolled back) whether or not anyone waits.
+  /// The CSeq is taken and the request queued in one actor turn of that task,
+  /// so requests go out in CSeq order.
   func play(_ options: PlayOptions) async throws {
+    try Task.checkCancellation()
+    try await valueUnlessCancelled(of: Task { try await self.sendPlay(options) })
+  }
+
+  /// The PAUSE, run as `play(_:)` runs its PLAY.
+  func pause() async throws {
+    try Task.checkCancellation()
+    try await valueUnlessCancelled(of: Task { try await self.sendPause() })
+  }
+
+  private func sendPlay(_ options: PlayOptions) async throws {
+    // The caller was cancelled before this task ran: nothing is sent.
+    try Task.checkCancellation()
     guard phase == .running, isPlaying, connection != nil else {
       throw RTSPError.invalidState("play() requires a started session")
     }
@@ -1873,7 +1942,9 @@ actor SessionState {
     }
   }
 
-  func pause() async throws {
+  private func sendPause() async throws {
+    // The caller was cancelled before this task ran: nothing is sent.
+    try Task.checkCancellation()
     guard phase == .running, isPlaying, connection != nil else {
       throw RTSPError.invalidState("pause() requires a started session")
     }
@@ -2969,7 +3040,12 @@ actor SessionState {
         do {
           try await conn.send(data)
         } catch {
-          self.resumePending(cseq, .failure(.connectionFailed("control send failed: \(error)")))
+          self.resumePending(
+            cseq,
+            .failure(
+              .connectionFailed(
+                "control send failed: \(error)",
+                underlying: (error as? RTSPError)?.underlyingNetworkError)))
         }
       }
       pendingTimeouts[cseq] = Task {
@@ -3057,6 +3133,9 @@ actor SessionState {
       // After stop() the session is being torn down: a retry would follow the
       // TEARDOWN with the dead session's id. TEARDOWN's own 401 is answered.
       guard method == .teardown || phase != .stopped else { return resp }
+      // A PLAY or PAUSE whose caller was cancelled sends nothing more; the
+      // 401 stands as the server's answer.
+      guard method == .teardown || !Task.isCancelled else { return resp }
       retries += 1
       sent = auth.sending
       resp = try await sendControlRequest(
@@ -3814,6 +3893,57 @@ actor SessionState {
   }
 }
 
+// MARK: - Waiting that the caller can cancel
+
+/// `task`'s value, or `CancellationError` as soon as the calling task is
+/// cancelled, whichever comes first. A cancelled caller cancels `task` too
+/// but doesn't wait for it to end.
+func valueUnlessCancelled<T: Sendable>(of task: Task<T, any Error>) async throws -> T {
+  let waiter = FirstResultWaiter<T>()
+  return try await withTaskCancellationHandler {
+    try await withCheckedThrowingContinuation { continuation in
+      waiter.install(continuation)
+      Task { waiter.resume(with: await task.result) }
+    }
+  } onCancel: {
+    task.cancel()
+    waiter.resume(with: .failure(CancellationError()))
+  }
+}
+
+/// Resumes one continuation, once, with the first result offered, which is
+/// kept when it comes before the continuation is installed. State is guarded
+/// by `lock`, hence `@unchecked Sendable`.
+private final class FirstResultWaiter<T: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<T, any Error>?
+  private var result: Result<T, any Error>?
+
+  func install(_ continuation: CheckedContinuation<T, any Error>) {
+    lock.lock()
+    guard let result else {
+      self.continuation = continuation
+      lock.unlock()
+      return
+    }
+    lock.unlock()
+    continuation.resume(with: result)
+  }
+
+  func resume(with offered: Result<T, any Error>) {
+    lock.lock()
+    guard result == nil else {
+      lock.unlock()
+      return
+    }
+    result = offered
+    let continuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+    continuation?.resume(with: offered)
+  }
+}
+
 // MARK: - URL helpers (free functions, testable)
 
 /// Where to open the RTSP control connection for a stream URL.
@@ -3839,28 +3969,28 @@ struct RTSPEndpoint: Equatable {
 func rtspEndpoint(for url: String, shownAs shownURL: String? = nil) throws -> RTSPEndpoint {
   let shown = redactedURL(shownURL ?? url)
   guard !url.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7F }) else {
-    throw RTSPError.connectionFailed(
+    throw RTSPError.invalidURL(
       "Invalid URL (contains a space or control character): \(shown)")
   }
-  guard let components = URLComponents(string: url) else {
-    throw RTSPError.connectionFailed("Invalid URL: \(shown)")
+  guard let components = URLComponents(string: percentEncodingForParsing(url)) else {
+    throw RTSPError.invalidURL("Invalid URL: \(shown)")
   }
   let scheme = components.scheme?.lowercased()
   guard scheme == "rtsp" || scheme == "rtsps" else {
-    throw RTSPError.connectionFailed("Invalid URL (expected rtsp:// or rtsps://): \(shown)")
+    throw RTSPError.invalidURL("Invalid URL (expected rtsp:// or rtsps://): \(shown)")
   }
   let usesTLS = scheme == "rtsps"
   guard let host = asciiHost(of: components) else {
-    throw RTSPError.connectionFailed("Invalid URL (no host): \(shown)")
+    throw RTSPError.invalidURL("Invalid URL (no host): \(shown)")
   }
   // A port too large for `Int` reads as no port, which would mean the
   // default one; an empty port (`host:`, `[::1]:`) does mean it.
   guard components.port != nil || components.rangeOfPort?.isEmpty != false else {
-    throw RTSPError.connectionFailed("Invalid port in URL: \(shown)")
+    throw RTSPError.invalidURL("Invalid port in URL: \(shown)")
   }
   let rawPort = components.port ?? (usesTLS ? 322 : 554)
   guard let port = UInt16(exactly: rawPort), port != 0 else {
-    throw RTSPError.connectionFailed("Invalid port \(rawPort) in URL: \(shown)")
+    throw RTSPError.invalidURL("Invalid port \(rawPort) in URL: \(shown)")
   }
   return RTSPEndpoint(host: host, port: port, usesTLS: usesTLS)
 }
@@ -3869,7 +3999,7 @@ func rtspEndpoint(for url: String, shownAs shownURL: String? = nil) throws -> RT
 /// RTSP request line early or let the rest be read as headers.
 func checkURLCharacters(_ url: String) throws {
   guard !url.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7F }) else {
-    throw RTSPError.connectionFailed(
+    throw RTSPError.invalidURL(
       "Invalid URL (contains a space or control character): \(redactedURL(url))")
   }
 }
@@ -3881,11 +4011,14 @@ func checkURLCharacters(_ url: String) throws {
 /// `rtsp://admin:p@ss/1@cam/` as host `ss`; `rtsp://corp/alice:pw@cam/` as
 /// host `corp`), which would get the password on the request line. Such a URL
 /// has an `@` after its host, and is rejected when it also has userinfo, a
-/// port on a host name or IPv4 address (how a password's start reads), or any
+/// port on a host name (how a user name and a password's start read), or any
 /// `:` between the host and the last `@` (a user name's rest and its password,
-/// whatever raw characters they hold). In such a URL a path or query `@` has
-/// to be written `%40`; a user name with a raw `/`, `?` or `#` and no password
-/// can't be told from a path and isn't caught.
+/// whatever raw characters they hold). An IPv4 address with a port, like a
+/// bracketed IPv6 one, isn't taken for a user name: ONVIF cameras report
+/// stream URIs such as `rtsp://192.0.2.5:554/live?password=Adm1n@2024`. In a
+/// rejected URL a path or query `@` has to be written `%40`; a user name with
+/// a raw `/`, `?` or `#` and no password can't be told from a path and isn't
+/// caught.
 func checkAmbiguousUserInfo(_ url: String) throws {
   // Unicode scalars, not Characters: URLComponents splits at an `@`, `/`, `?`,
   // `#` or `:` that a combining mark follows, which makes the pair one
@@ -3897,62 +4030,218 @@ func checkAmbiguousUserInfo(_ url: String) throws {
   else { return }
   let authority = rest[..<authorityEnd]
   guard
-    authority.contains("@") || (authority.first != "[" && authority.contains(":"))
+    authority.contains("@")
+      || (authority.first != "[" && authority.contains(":")
+        && !isIPv4AddressWithPort(authority))
       || rest[authorityEnd..<at].contains(":")
   else { return }
-  throw RTSPError.connectionFailed(
+  throw RTSPError.invalidURL(
     "Invalid URL (an @ after the host that may end a user name or password; write /, ?, # and "
       + "@ in a user name or password as %2F, %3F, %23 and %40, and an @ in the path as %40): "
       + "\(redactedURL(url))")
 }
 
-/// Split `user:password@` out of a URL: the URL without it, and the
-/// percent-decoded credentials (an absent password is empty). A URL without
-/// userinfo, or one `URLComponents` can't parse, is returned unchanged.
-/// Throws when the user name or password doesn't decode to UTF-8 (`%FF`),
-/// rather than authenticating with an empty one.
-func splitUserInfo(_ url: String) throws -> (url: String, credentials: Credentials?) {
-  guard var components = URLComponents(string: percentEncodingNonASCII(url)),
-    components.percentEncodedUser != nil || components.percentEncodedPassword != nil
-  else { return (url, nil) }
-  guard components.percentEncodedUser == nil || components.user != nil,
-    components.percentEncodedPassword == nil || components.password != nil
-  else {
-    throw RTSPError.connectionFailed(
-      "Invalid URL (the user name or password isn't percent-encoded UTF-8): \(redactedURL(url))")
+/// Whether `authority` is an IPv4 address in dotted-decimal form (four
+/// numbers up to 255), a `:` and a port of one to five digits.
+private func isIPv4AddressWithPort(_ authority: Substring.UnicodeScalarView) -> Bool {
+  func isDigits(_ part: Substring.UnicodeScalarView, count: ClosedRange<Int>) -> Bool {
+    count.contains(part.count) && part.allSatisfy { ("0"..."9").contains($0) }
   }
-  let credentials = Credentials(
-    username: components.user ?? "", password: components.password ?? "")
-  components.percentEncodedUser = nil
-  components.percentEncodedPassword = nil
-  guard let stripped = components.string else { return (url, nil) }
-  return (stripped, credentials)
+  let hostAndPort = authority.split(separator: ":", omittingEmptySubsequences: false)
+  guard hostAndPort.count == 2, isDigits(hostAndPort[1], count: 1...5) else { return false }
+  let octets = hostAndPort[0].split(separator: ".", omittingEmptySubsequences: false)
+  return octets.count == 4
+    && octets.allSatisfy { octet in
+      isDigits(octet, count: 1...3) && octet.reduce(0) { $0 * 10 + Int($1.value - 48) } <= 255
+    }
 }
 
-/// `url` as an ASCII URI, for the request line: a URL with non-ASCII
-/// characters, or a percent-encoded host name, gets its host name in IDNA
-/// (`xn--`) form and its path and query percent-encoded, as `URLComponents`
-/// writes it. Any other ASCII URL is returned unchanged.
+/// Where `URLComponents` finds the parts of a URL string, as offsets into its
+/// Unicode scalars. After the scheme and `//`, the authority runs to the
+/// first `/`, `?` or `#`; its user name and password run to its last `@`,
+/// and the user name to their first `:`. The path runs to the first `?` or
+/// `#`, the query to the first `#` after it, and the fragment to the end.
+/// Scalars, not Characters, as `URLComponents` reads the URL: a delimiter
+/// that a combining mark follows still delimits.
+struct URLLayout {
+  let scalars: [Unicode.Scalar]
+  /// The scheme and its `:`; empty when the URL doesn't start with one.
+  let scheme: Range<Int>
+  /// The authority, after its `//`; nil without `//`.
+  let authority: Range<Int>?
+  /// The user name and password, without the `@` after them; nil without an
+  /// `@` in the authority.
+  let userInfo: Range<Int>?
+  /// The `:` between the user name and the password.
+  let passwordColon: Int?
+  /// The host, without the port; nil without an authority.
+  let host: Range<Int>?
+  /// The fragment, after its `#`; nil without a `#`.
+  let fragment: Range<Int>?
+
+  init(_ url: String) {
+    let scalars = Array(url.unicodeScalars)
+    self.scalars = scalars
+    func isLetter(_ c: Unicode.Scalar) -> Bool {
+      ("a"..."z").contains(c) || ("A"..."Z").contains(c)
+    }
+    // A scheme is a letter, then letters, digits, `+`, `-` or `.` (RFC 3986).
+    var index = 0
+    if let colon = scalars.firstIndex(of: ":"), colon > 0, isLetter(scalars[0]),
+      scalars[..<colon].allSatisfy({
+        isLetter($0) || ("0"..."9").contains($0) || "+-.".unicodeScalars.contains($0)
+      })
+    {
+      index = colon + 1
+    }
+    scheme = 0..<index
+    if scalars[index...].starts(with: "//".unicodeScalars) {
+      let start = index + 2
+      let end =
+        scalars[start...].firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" })
+        ?? scalars.count
+      authority = start..<end
+      var hostStart = start
+      if let at = scalars[start..<end].lastIndex(of: "@") {
+        userInfo = start..<at
+        passwordColon = scalars[start..<at].firstIndex(of: ":")
+        hostStart = at + 1
+      } else {
+        userInfo = nil
+        passwordColon = nil
+      }
+      var hostEnd = end
+      if hostStart < end, scalars[hostStart] == "[" {
+        if let close = scalars[hostStart..<end].firstIndex(of: "]") { hostEnd = close + 1 }
+      } else if let colon = scalars[hostStart..<end].firstIndex(of: ":") {
+        hostEnd = colon
+      }
+      host = hostStart..<hostEnd
+      index = end
+    } else {
+      authority = nil
+      userInfo = nil
+      passwordColon = nil
+      host = nil
+    }
+    fragment = scalars[index...].firstIndex(of: "#").map { ($0 + 1)..<scalars.count }
+  }
+
+  /// The URL with `range` replaced by `replacement`.
+  func replacing(_ range: Range<Int>, with replacement: String) -> String {
+    var result = scalars
+    result.replaceSubrange(range, with: replacement.unicodeScalars)
+    return String(String.UnicodeScalarView(result))
+  }
+}
+
+/// `url` with every character percent-encoded that `URLComponents(string:)`
+/// would encode itself, so that it parses the result without changing it.
+/// When `URLComponents` has to encode a character in a component, it encodes
+/// the `%` of every escape already in that component too, and the escapes
+/// then decode to themselves (`£ecret|1` read as `%C2%A3ecret|1`). These are
+/// encoded: non-ASCII characters (as their UTF-8 bytes), spaces and control
+/// characters, `"` `<` `>` `[` `\` `]` `^` `` ` `` `{` `|` `}`, a `%` that
+/// two hex digits don't follow, in the user name and password every `@` but
+/// the one ending them and every `:` but the one between them, and in the
+/// fragment every `#`. The scheme, host and port stay as written, apart from
+/// non-ASCII characters, so a zone id (`[fe80::1%en0]`) keeps working.
+func percentEncodingForParsing(_ url: String) -> String {
+  let layout = URLLayout(url)
+  let scalars = layout.scalars
+  let hostAndPort = layout.host.flatMap { host in
+    layout.authority.map { host.lowerBound..<$0.upperBound }
+  }
+  func isHexDigit(_ offset: Int) -> Bool {
+    offset < scalars.count && scalars[offset].properties.isASCIIHexDigit
+  }
+  func mustEncode(_ offset: Int) -> Bool {
+    let scalar = scalars[offset]
+    if !scalar.isASCII || scalar.value <= 0x20 || scalar.value == 0x7F { return true }
+    if layout.scheme.contains(offset) || hostAndPort?.contains(offset) == true { return false }
+    if "\"<>[\\]^`{|}".unicodeScalars.contains(scalar) { return true }
+    if scalar == "%" { return !(isHexDigit(offset + 1) && isHexDigit(offset + 2)) }
+    if layout.userInfo?.contains(offset) == true {
+      return scalar == "@" || (scalar == ":" && offset != layout.passwordColon)
+    }
+    return scalar == "#" && layout.fragment?.contains(offset) == true
+  }
+  guard scalars.indices.contains(where: mustEncode) else { return url }
+  var encoded = String.UnicodeScalarView()
+  for offset in scalars.indices {
+    guard mustEncode(offset) else {
+      encoded.append(scalars[offset])
+      continue
+    }
+    for byte in String(scalars[offset]).utf8 {
+      encoded.append(contentsOf: String(format: "%%%02X", byte).unicodeScalars)
+    }
+  }
+  return String(encoded)
+}
+
+/// `url` without its `user:password@`, everything else as written. The
+/// userinfo is what `URLComponents` takes for it: up to the authority's last
+/// `@`.
+func removingUserInfo(_ url: String) -> String {
+  let layout = URLLayout(url)
+  guard let userInfo = layout.userInfo else { return url }
+  // The `@` after the userinfo goes too.
+  return layout.replacing(userInfo.lowerBound..<(userInfo.upperBound + 1), with: "")
+}
+
+/// The percent-decoded credentials in `url`'s `user:password@` (an absent
+/// password is empty); nil when the URL has no userinfo or `URLComponents`
+/// can't parse it. Throws when the user name or password doesn't decode to
+/// UTF-8 (`%FF`), rather than authenticating with an empty one.
+func credentialsInUserInfo(_ url: String) throws -> Credentials? {
+  guard URLLayout(url).userInfo != nil,
+    let components = URLComponents(string: percentEncodingForParsing(url)),
+    components.percentEncodedUser != nil || components.percentEncodedPassword != nil
+  else { return nil }
+  // Decoded here rather than read from `user` and `password`, which drop a
+  // leading U+FEFF.
+  func decoded(_ part: String?) throws -> String {
+    guard let part else { return "" }
+    guard let text = part.removingPercentEncoding else {
+      throw RTSPError.invalidURL(
+        "Invalid URL (the user name or password isn't percent-encoded UTF-8): \(redactedURL(url))")
+    }
+    return text
+  }
+  return Credentials(
+    username: try decoded(components.percentEncodedUser),
+    password: try decoded(components.percentEncodedPassword))
+}
+
+/// Split `user:password@` out of a URL: `removingUserInfo(url)` and
+/// `credentialsInUserInfo(url)`.
+func splitUserInfo(_ url: String) throws -> (url: String, credentials: Credentials?) {
+  (removingUserInfo(url), try credentialsInUserInfo(url))
+}
+
+/// `url` as an ASCII URI, for the request line: a Unicode or
+/// percent-encoded host name in IDNA (`xn--`) form, and non-ASCII characters
+/// elsewhere percent-encoded. Everything else is kept as written, escapes and
+/// characters a URI can't hold raw (`{`, `|`) included, so the URL names the
+/// same resource whatever its host.
 func asciiURL(_ url: String) -> String {
   let encoded = percentEncodingNonASCII(url)
-  guard var components = URLComponents(string: encoded) else { return url }
+  let layout = URLLayout(url)
+  guard let hostRange = layout.host,
+    let components = URLComponents(string: percentEncodingForParsing(url))
+  else { return encoded }
   // A host written percent-encoded (`caf%C3%A9.example`), or in Unicode,
   // goes as the name connected to (`xn--caf-dma.example`).
   let encodedHost = components.encodedHost ?? ""
   guard !encodedHost.hasPrefix("["), encodedHost.contains("%"),
     let host = asciiHost(of: components)
   else { return encoded }
-  components.encodedHost = host
-  guard let ascii = components.string, ascii.unicodeScalars.allSatisfy(\.isASCII) else {
-    return encoded
-  }
-  return ascii
+  return percentEncodingNonASCII(layout.replacing(hostRange, with: host))
 }
 
 /// `url` with every non-ASCII scalar written as the percent-encoded bytes of
-/// its UTF-8, and nothing else changed. `URLComponents` encodes a component
-/// holding a non-ASCII character itself, but then encodes the `%` of the
-/// escapes already in it too (`pässw%40rd` stays `pässw%40rd` once decoded).
+/// its UTF-8, and nothing else changed.
 func percentEncodingNonASCII(_ url: String) -> String {
   guard !url.unicodeScalars.allSatisfy(\.isASCII) else { return url }
   var encoded = ""
