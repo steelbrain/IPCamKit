@@ -14,7 +14,9 @@ jobs:
     # have a different head repo and are skipped, so they never reach the
     # macOS runner or install dependencies.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: macos-15
+    # Swift 6.4 ships with Xcode 27, which GitHub only offers on the xcode-27
+    # (preview) image; macos-15 defaults to Xcode 16.4 (Swift 6.1).
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,7 +37,7 @@ jobs:
   lint:
     name: Lint
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: macos-15
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
         with:
