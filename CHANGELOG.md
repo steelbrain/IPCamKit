@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- The package needs Swift 6.4 (Xcode 27) or later: `Package.swift` declares
+  `swift-tools-version: 6.4`, up from 6.0. Swift Package Manager on an older
+  toolchain refuses to resolve it.
+
 ## 0.5.0
 
 ### Breaking changes

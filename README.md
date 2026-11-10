@@ -19,7 +19,7 @@ Tested with Reolink, Dahua, Hikvision, Longse, GW Security, VStarcam, Tenda, Fos
 ## Requirements
 
 - macOS 13.0+, iOS 16.0+, tvOS 16.0+, Mac Catalyst 16.0+, visionOS 1.0+
-- Swift 6.0+
+- Swift 6.4+ (Xcode 27+)
 
 ## Installation
 
